@@ -1,0 +1,16 @@
+[package]
+name = "cove-guest"
+description = "The agent that runs inside every cove VM"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cove-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+portable-pty = "0.9"
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+vsock = "0.5"
