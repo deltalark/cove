@@ -1,0 +1,24 @@
+[package]
+name = "cove-core"
+description = "VMs, disks, images and backends for cove"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cove-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+futures-util = "0.3"
+sha2 = "0.10"
+xz2 = { version = "0.1", features = ["static"] }
+tar = "0.4"
+fatfs = "0.3"
+getrandom = "0.2"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

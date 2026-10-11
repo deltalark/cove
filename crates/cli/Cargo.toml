@@ -1,0 +1,29 @@
+[package]
+name = "cove"
+description = "Self-hosted microVMs for people and coding agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cove"
+path = "src/main.rs"
+
+[dependencies]
+cove-proto.workspace = true
+cove-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+axum = { version = "0.8", features = ["ws"] }
+clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+crossterm = "0.28"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
