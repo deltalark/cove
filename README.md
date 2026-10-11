@@ -1,96 +1,174 @@
+<div align="center">
+
 # Cove
 
-Self-hosted microVMs for people and coding agents. Run it on your Mac or on a Linux server, and get fast, persistent Linux VMs you can drive from a CLI, an HTTP API or MCP. It is built to work hand in hand with [Runo](https://github.com/deltalark/runo): a Runo session can run inside a VM instead of on your machine.
+**Self-hosted microVMs for people and coding agents.**
 
-**Status: early.** The macOS backend, the guest agent, the API, the CLI and the MCP server are here. The Linux backend, the HTTPS proxy, sharing and pairing with Runo come next; see [the plan](docs/plan.md).
+Fast, persistent Linux VMs on your Mac or your own server,
+driven from a CLI, an HTTP API or MCP.
 
-## What you get
+[![CI](https://github.com/deltalark/cove/actions/workflows/ci.yml/badge.svg)](https://github.com/deltalark/cove/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Rust](https://img.shields.io/badge/built%20with-Rust-b7410e?logo=rust&logoColor=white)
+![macOS · Apple Silicon](https://img.shields.io/badge/macOS-Apple%20Silicon-lightgrey?logo=apple)
+![Status: early](https://img.shields.io/badge/status-early-orange)
 
-- **Real Linux VMs** (Debian 13, you are root) that boot from a shared base image. Each VM's disk is a clone of the base, so a new VM costs almost no disk until it changes things.
-- **Folders shared live** from the host into the VM (virtio-fs), so you can edit on your Mac and build in the VM, or the other way round.
-- **Processes that outlive your connection.** `cove spawn` starts a named process in the VM; disconnect, come back later, and `cove attach` replays what you missed and keeps streaming. Runo uses this so agents keep working while the laptop sleeps.
-- **Ports forwarded** from the VM to your machine with one command.
-- **An MCP server** so any agent can create VMs, run commands, move files and share ports.
-- **Isolation:** the VM only sees the folders you share and the credentials you pass it. Commands an agent runs there can't touch your home folder, keychain or SSH keys.
+[Why Cove](#why-cove) · [Quick start](#quick-start) · [CLI](#cli) · [API](#http-api) · [MCP](#mcp) · [Runo](#cove-and-runo) · [How it works](#how-it-works)
 
-## Quick start (macOS, Apple Silicon)
+</div>
+
+---
+
+```console
+$ cove up dev --mount ~/code/myapp:/work
+$ cove shell dev --cwd /work
+root@dev:/work# cargo test
+```
+
+## Why Cove
+
+Coding agents are most useful when you let them run commands freely, and most dangerous for the same reason. Cove gives every agent, or every person, a real Linux machine of its own that boots in seconds, keeps its state, and can only see what you hand it.
+
+- **Real Linux VMs.** Debian 13, and you are root. Every VM boots from a shared base image, and its disk is a copy-on-write clone, so a new VM costs almost no disk until it changes things.
+- **Live shared folders.** Share host folders into the VM with virtio-fs. Edit on your Mac and build in the VM, or the other way round.
+- **Processes that outlive your connection.** `cove spawn` starts a named process in the VM. Disconnect, come back later, and `cove attach` replays what you missed and keeps streaming. Agents keep working while your laptop sleeps.
+- **Ports in one command.** See what is listening inside a VM and forward it to your machine.
+- **Built for agents.** An MCP server lets any agent create VMs, run commands, move files and share ports.
+- **Real isolation.** A VM sees only the folders you share and the credentials you pass. Commands an agent runs there can't touch your home folder, keychain or SSH keys.
+
+## Quick start
+
+macOS on Apple Silicon. You need [Rust](https://rustup.rs), [Homebrew](https://brew.sh), and [zig](https://ziglang.org) with [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) to build the guest agent.
 
 ```sh
-brew install vfkit                      # the Virtualization.framework launcher
+brew install vfkit                     # the Virtualization.framework launcher
 cargo build --release
-scripts/build-guest.sh                  # the agent that runs inside VMs (needs zig + cargo-zigbuild)
-target/release/cove serve &           # the server; data lives in ~/.cove
-target/release/cove doctor
+scripts/build-guest.sh                 # the agent that runs inside VMs
+
+target/release/cove serve &            # the server; data lives in ~/.cove
+target/release/cove doctor             # check that everything is in place
 target/release/cove image pull debian-13
 target/release/cove up dev --mount ~/code/myapp:/work
 target/release/cove shell dev --cwd /work
 ```
 
-`scripts/smoke-vm.sh` boots a VM and checks exec, shared folders, networking, ports and restarts.
+Want to check a fresh install end to end? `scripts/smoke-vm.sh` boots a VM and tests exec, shared folders, networking, ports and restarts.
 
 ## CLI
 
-```
-cove serve [--listen 127.0.0.1:7457]
-cove doctor | key
-cove image ls | pull <image>
-cove up <name> [--cpus 2] [--memory 4096] [--disk 20] [--mount HOST:GUEST[:ro]]... [--ephemeral] [--tag T]...
-cove ls | show <name> | start <name> | stop <name> | rm <name> | copy <from> <to>
-cove exec <name> [-t] [--cwd DIR] [-e K=V]... -- <command...>
-cove shell <name> [--cwd DIR]
-cove spawn <name> <proc> [-t] [-a] -- <command...>
-cove attach <name> <proc> [--from BYTES]
-cove procs <name> | kill <name> <proc>
-cove push <name> <local> <remote> | pull <name> <remote> <local>
-cove ports <name> | forward <name> <port>
-cove mcp
-```
+| Command | What it does |
+| --- | --- |
+| `cove serve [--listen 127.0.0.1:7457]` | Run the server |
+| `cove doctor` | Check the host setup |
+| `cove key` | Print the API key |
+| `cove image ls` · `cove image pull <image>` | List and download base images |
+| `cove up <name> [options]` | Create and start a VM (options below) |
+| `cove ls` · `cove show <name>` | List VMs, or show one |
+| `cove start <name>` · `cove stop <name>` · `cove rm <name>` | Start, stop or delete a VM |
+| `cove copy <from> <to>` | Clone a VM |
+| `cove exec <name> [-t] [--cwd DIR] [-e K=V]... -- <command...>` | Run a command and wait for it |
+| `cove shell <name> [--cwd DIR]` | Open an interactive shell |
+| `cove spawn <name> <proc> [-t] [-a] -- <command...>` | Start a named background process |
+| `cove attach <name> <proc> [--from BYTES]` | Reattach to a process and replay its output |
+| `cove procs <name>` · `cove kill <name> <proc>` | List or stop processes |
+| `cove push <name> <local> <remote>` · `cove pull <name> <remote> <local>` | Copy files in and out |
+| `cove ports <name>` · `cove forward <name> <port>` | List ports and forward one |
+| `cove mcp` | Run the MCP server over stdio |
 
-Add `--json` to any command for machine-readable output, and `--host URL` to talk to another server.
+`cove up` takes `--cpus 2`, `--memory 4096` (MB), `--disk 20` (GB), any number of `--mount HOST:GUEST[:ro]`, `--ephemeral` and `--tag T`.
 
-## API
+Add `--json` to any command for machine-readable output, and `--host URL` to talk to another Cove server.
 
-Every request carries `Authorization: Bearer <key>`; the key is created on first start in `~/.cove/api-key` (`cove key` prints it).
+## HTTP API
 
-| Method | Path | |
+Every request carries `Authorization: Bearer <key>`. The key is created on first start in `~/.cove/api-key`, and `cove key` prints it.
+
+| Method | Path | Notes |
 | --- | --- | --- |
-| GET | `/v1/health` | no auth |
-| GET | `/v1/images` | |
-| POST | `/v1/images/{name}/pull` | |
-| GET, POST | `/v1/vms` | POST takes `name, image, cpus, memory_mb, disk_gb, mounts, ephemeral, tags, start` |
-| GET, DELETE | `/v1/vms/{name}` | |
-| POST | `/v1/vms/{name}/start`, `/stop`, `/copy` | |
-| POST | `/v1/vms/{name}/exec` | runs to completion, returns `code, stdout, stderr` |
-| GET (WebSocket) | `/v1/vms/{name}/stream` | first message: an `exec`, `spawn` or `attach` request; then frames out, input in |
-| GET | `/v1/vms/{name}/procs` | |
-| DELETE | `/v1/vms/{name}/procs/{proc}` | `?signal=` |
-| GET, PUT | `/v1/vms/{name}/files?path=` | raw bytes; PUT takes `&mode=755` |
-| GET | `/v1/vms/{name}/dir?path=` | |
-| GET | `/v1/vms/{name}/ports` | listening ports and forwards |
-| POST, DELETE | `/v1/vms/{name}/forwards`, `/forwards/{port}` | |
+| `GET` | `/v1/health` | No auth |
+| `GET` | `/v1/images` | |
+| `POST` | `/v1/images/{name}/pull` | |
+| `GET` `POST` | `/v1/vms` | POST takes `name, image, cpus, memory_mb, disk_gb, mounts, ephemeral, tags, start` |
+| `GET` `DELETE` | `/v1/vms/{name}` | |
+| `POST` | `/v1/vms/{name}/start`, `/stop`, `/copy` | |
+| `POST` | `/v1/vms/{name}/exec` | Runs to completion and returns `code, stdout, stderr` |
+| `GET` (WebSocket) | `/v1/vms/{name}/stream` | First message is an `exec`, `spawn` or `attach` request; then frames out, input in |
+| `GET` | `/v1/vms/{name}/procs` | |
+| `DELETE` | `/v1/vms/{name}/procs/{proc}` | `?signal=` |
+| `GET` `PUT` | `/v1/vms/{name}/files?path=` | Raw bytes; PUT takes `&mode=755` |
+| `GET` | `/v1/vms/{name}/dir?path=` | |
+| `GET` | `/v1/vms/{name}/ports` | Listening ports and forwards |
+| `POST` `DELETE` | `/v1/vms/{name}/forwards`, `/forwards/{port}` | |
 
 The stream's frames and requests are the types in [`crates/proto`](crates/proto/src/lib.rs).
 
+```sh
+curl -s -H "Authorization: Bearer $(cove key)" -H "Content-Type: application/json" \
+  -d '{"cmd":["uname","-a"]}' http://127.0.0.1:7457/v1/vms/dev/exec
+```
+
 ## MCP
+
+Give any MCP-capable agent its own machines:
 
 ```json
 { "mcpServers": { "Cove": { "command": "cove", "args": ["mcp"] } } }
 ```
 
-Tools: `vm_list`, `vm_create`, `vm_exec`, `vm_read_file`, `vm_write_file`, `vm_share_port`, `vm_destroy`.
+| Tool | What it does |
+| --- | --- |
+| `vm_list` | List VMs |
+| `vm_create` | Create and start a VM |
+| `vm_exec` | Run a command |
+| `vm_read_file` · `vm_write_file` | Read and write files |
+| `vm_share_port` | Forward a port to the host |
+| `vm_destroy` | Delete a VM |
+
+## Cove and Runo
+
+Cove is built to work hand in hand with [Runo](https://github.com/deltalark/runo), the native app for running coding agents side by side. When `cove serve` is running, Runo's **New session** offers **Runs on: Cove VM**:
+
+- The agent, the worktree setup command and terminal tabs run inside the session's own VM.
+- The session's worktree is shared into the VM at the same path, so git, diffs, commits and pull requests keep running on the Mac against the same files.
+- Only the API keys Runo passes explicitly reach the VM, and deleting the session deletes its VM.
 
 ## How it works
 
-```
- cove CLI ─┐
- Runo ───────┼─ HTTP/WebSocket ─▶ cove serve ──▶ vfkit (Virtualization.framework) ──▶ VM
- MCP agents ─┘                        │                                                  │
-                                      └──────────── vsock ──────────▶ cove-guest ◀───┘
+```mermaid
+flowchart LR
+    CLI["cove CLI"] --> S
+    Runo["Runo"] --> S
+    MCP["MCP agents"] --> S
+    S["cove serve<br/>HTTP + WebSocket"] --> V["vfkit<br/>Virtualization.framework"]
+    V --> VM
+    subgraph VM["Linux VM"]
+        G["cove-guest"]
+    end
+    S <-- "vsock" --> G
 ```
 
-- `cove serve` keeps VM records in `~/.cove/vms/<name>/`, clones the base disk for each VM, and builds a small cloud-init seed disk on every start that installs the guest agent.
-- `cove-guest` is a static Linux binary inside the VM. It listens on vsock port 1024 and runs commands, terminals, file operations and port pipes, one request per connection.
-- VMs run as their own processes, so restarting the server doesn't stop them; it finds them again from `run.json`.
+- **`cove serve`** keeps VM records in `~/.cove/vms/<name>/`, clones the base disk for each VM, and builds a small cloud-init seed disk on every start that installs the guest agent.
+- **`cove-guest`** is a static Linux binary inside the VM. It listens on vsock port 1024 and handles commands, terminals, file operations and port pipes, one request per connection.
+- **VMs are their own processes**, so restarting the server doesn't stop them; it finds them again from `run.json`.
+
+| Crate | Role |
+| --- | --- |
+| [`crates/cli`](crates/cli) | The `cove` binary: server, CLI client and MCP server |
+| [`crates/core`](crates/core) | VM manager, backends, images and the cloud-init seed |
+| [`crates/guest`](crates/guest) | `cove-guest`, the agent inside each VM |
+| [`crates/proto`](crates/proto) | Wire types shared by server, client and guest |
+
+## Roadmap
+
+Cove is early. Here today: the macOS backend, the guest agent, the API, the CLI and the MCP server. Coming next:
+
+- [ ] Linux backend (cloud-hypervisor with KVM) for a VPS or bare metal
+- [ ] HTTPS proxy with a private-by-default URL for every VM
+- [ ] Sharing VMs and previews
+- [ ] Pairing a remote Cove server with Runo
+- [ ] Snapshots and a web dashboard
+
+See [the full plan](docs/plan.md) for details and the security model.
 
 ## Development
 
@@ -102,4 +180,4 @@ The end-to-end tests use the `host` backend, which runs the guest agent as a nor
 
 ## License
 
-MIT
+[MIT](LICENSE)
