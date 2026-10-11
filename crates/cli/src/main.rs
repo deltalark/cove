@@ -192,7 +192,7 @@ struct Ensure {
     #[arg(long, default_value_t = 4096)]
     memory: u64,
     /// With --create: vfkit, cloud-hypervisor or host (development only).
-    #[arg(long, default_value = "")]
+    #[arg(long, env = "COVE_BACKEND", default_value = "")]
     backend: String,
 }
 
