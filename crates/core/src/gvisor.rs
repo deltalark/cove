@@ -409,11 +409,15 @@ pub fn release_mounts(vm_dir: &Path) {
         return;
     };
     for path in mounts_under(&text, vm_dir) {
+        // Only Linux has /proc/self/mounts, so elsewhere there is nothing to detach.
+        #[cfg(target_os = "linux")]
         if let Ok(c) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
             unsafe {
                 libc::umount2(c.as_ptr(), libc::MNT_DETACH);
             }
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = path;
     }
 }
 
