@@ -50,7 +50,7 @@ pub async fn run(client: &Client, vm: &str, request: Request) -> Result<i32> {
         let input_tx = input_tx.clone();
         std::thread::spawn(move || {
             let mut stdin = std::io::stdin();
-            let mut buf = [0u8; 4096];
+            let mut buf = vec![0u8; 64 * 1024];
             loop {
                 match stdin.read(&mut buf) {
                     Ok(0) | Err(_) => {

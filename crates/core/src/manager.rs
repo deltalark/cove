@@ -2,15 +2,15 @@
 
 use crate::backend::{self, Launch};
 use crate::guest::GuestAddr;
-use crate::model::{Forward, VmRecord, VmSpec, VmState, VmStatus};
+use crate::model::{Forward, Network, VmRecord, VmSpec, VmState, VmStatus};
 use crate::paths::Paths;
 use crate::{image, seed};
 use anyhow::{anyhow, bail, Context, Result};
 use cove_proto::Request;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
@@ -25,11 +25,34 @@ struct Live {
     forwards: Vec<(Forward, tokio::task::JoinHandle<()>)>,
 }
 
+/// How recently a VM was used, for idle stop.
+struct Activity {
+    last: Instant,
+    /// Exec, spawn and attach streams open right now. An open stream is activity
+    /// however quiet it is (a shell someone is reading).
+    streams: usize,
+}
+
+/// Whether a VM with an idle timer of `idle` should be stopped: nothing has used it
+/// for that long, no stream is open, and no named process is running.
+pub fn idle_expired(
+    idle: Duration,
+    since_activity: Duration,
+    open_streams: usize,
+    running_procs: usize,
+) -> bool {
+    open_streams == 0 && running_procs == 0 && since_activity >= idle
+}
+
 pub struct Manager {
     pub paths: Paths,
     live: Mutex<HashMap<String, Live>>,
+    /// A plain mutex: touched on every guest request, never held across an await.
+    activity: std::sync::Mutex<HashMap<String, Activity>>,
     /// Serialises lifecycle changes per VM.
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Held from picking a network slot until the VM holding it is recorded.
+    net_lock: Mutex<()>,
     /// Host name used in forwarded-port URLs.
     pub url_host: String,
 }
@@ -40,7 +63,9 @@ impl Manager {
         Ok(Arc::new(Manager {
             paths,
             live: Mutex::new(HashMap::new()),
+            activity: std::sync::Mutex::new(HashMap::new()),
             locks: Mutex::new(HashMap::new()),
+            net_lock: Mutex::new(()),
             url_host: "127.0.0.1".into(),
         }))
     }
@@ -112,6 +137,8 @@ impl Manager {
             mounts: record.spec.mounts.clone(),
             ephemeral: record.spec.ephemeral,
             tags: record.spec.tags.clone(),
+            network: record.spec.network,
+            idle_stop_minutes: record.spec.idle_stop_minutes,
             created_at: record.created_at,
             error: entry.and_then(|l| l.error.clone()),
             forwards: entry
@@ -127,8 +154,25 @@ impl Manager {
         entry.error = error;
     }
 
-    /// The guest agent of a running VM.
+    /// Network slots held by running VMs.
+    fn net_slots_in_use(&self) -> Vec<u32> {
+        self.names()
+            .iter()
+            .filter_map(|n| Launch::load(&self.paths.vm_dir(n)))
+            .filter(|l| l.alive())
+            .filter_map(|l| l.net)
+            .collect()
+    }
+
+    /// The guest agent of a running VM. Counts as activity for idle stop; the idle
+    /// check itself uses [`Manager::running_guest`], which doesn't.
     pub fn guest(&self, name: &str) -> Result<GuestAddr> {
+        let guest = self.running_guest(name)?;
+        self.touch(name);
+        Ok(guest)
+    }
+
+    fn running_guest(&self, name: &str) -> Result<GuestAddr> {
         self.record(name)?;
         match Launch::load(&self.paths.vm_dir(name)) {
             Some(l) if l.alive() => Ok(l.guest),
@@ -136,9 +180,86 @@ impl Manager {
         }
     }
 
+    /// Record that `name` was just used.
+    pub fn touch(&self, name: &str) {
+        let mut activity = self.activity.lock().unwrap();
+        activity
+            .entry(name.to_string())
+            .and_modify(|a| a.last = Instant::now())
+            .or_insert(Activity {
+                last: Instant::now(),
+                streams: 0,
+            });
+    }
+
+    /// Mark a stream to `name` open until the guard is dropped.
+    pub fn stream_opened(self: &Arc<Self>, name: &str) -> StreamGuard {
+        self.touch(name);
+        if let Some(a) = self.activity.lock().unwrap().get_mut(name) {
+            a.streams += 1;
+        }
+        StreamGuard {
+            manager: Arc::downgrade(self),
+            name: name.to_string(),
+        }
+    }
+
+    fn stream_closed(&self, name: &str) {
+        if let Some(a) = self.activity.lock().unwrap().get_mut(name) {
+            a.streams = a.streams.saturating_sub(1);
+            a.last = Instant::now();
+        }
+    }
+
+    /// Stop running VMs whose idle timer ran out; returns their names. `minute` is
+    /// how long a minute of `idle_stop_minutes` lasts (shorter in tests).
+    pub async fn stop_idle(self: &Arc<Self>, minute: Duration) -> Vec<String> {
+        let mut stopped = Vec::new();
+        for name in self.names() {
+            let Ok(record) = self.record(&name) else {
+                continue;
+            };
+            let Some(minutes) = record.spec.idle_stop_minutes else {
+                continue;
+            };
+            let Ok(guest) = self.running_guest(&name) else {
+                continue;
+            };
+            // A VM nobody has touched since this server started counts from now.
+            let (since, streams) = {
+                let mut activity = self.activity.lock().unwrap();
+                let a = activity.entry(name.clone()).or_insert(Activity {
+                    last: Instant::now(),
+                    streams: 0,
+                });
+                (a.last.elapsed(), a.streams)
+            };
+            let idle = minute * minutes.min(u32::MAX as u64) as u32;
+            if !idle_expired(idle, since, streams, 0) {
+                continue;
+            }
+            // Only ask the guest once everything else says idle. If it doesn't
+            // answer, leave the VM alone rather than stop it blind.
+            let Ok(procs) = guest
+                .call_as::<Vec<cove_proto::ProcInfo>>(&Request::Procs)
+                .await
+            else {
+                continue;
+            };
+            let running = procs.iter().filter(|p| p.running).count();
+            if idle_expired(idle, since, streams, running) && self.stop(&name).await.is_ok() {
+                stopped.push(name);
+            }
+        }
+        stopped
+    }
+
     pub async fn create(self: &Arc<Self>, spec: VmSpec, start: bool) -> Result<VmStatus> {
         if !crate::valid_name(&spec.name) {
             bail!("VM names use lowercase letters, digits and dashes (max 40)");
+        }
+        if spec.idle_stop_minutes == Some(0) {
+            bail!("idle stop takes at least 1 minute");
         }
         let backend = backend::resolve(&spec.backend)?;
         backend::check(backend).map_err(|e| anyhow!(e))?;
@@ -153,13 +274,30 @@ impl Manager {
                 bail!("{} is not a folder on this machine", m.host);
             }
         }
+        if backend == backend::CLOUD_HYPERVISOR {
+            crate::chv::check_spec(&spec, &crate::chv::Host::detect(&self.paths))?;
+        }
+        if backend == backend::GVISOR {
+            crate::gvisor::check_spec(&spec, &crate::chv::Host::detect(&self.paths))?;
+        }
         let lock = self.lock(&spec.name).await;
         let _guard = lock.lock().await;
         let dir = self.paths.vm_dir(&spec.name);
         if dir.join("vm.json").exists() {
             bail!("a VM named {:?} already exists", spec.name);
         }
-        if backend != backend::HOST {
+        if backend == backend::GVISOR {
+            let base = image::rootfs_path(&self.paths, &spec.image);
+            if !base.is_dir() {
+                bail!(
+                    "image {:?} is not pulled yet: cove image pull {}",
+                    spec.image,
+                    spec.image
+                );
+            }
+            std::fs::create_dir_all(&dir)?;
+            crate::gvisor::copy_tree(&base, &crate::gvisor::rootfs(&dir))?;
+        } else if backend != backend::HOST {
             let base = image::disk_path(&self.paths, &spec.image);
             if !base.is_file() {
                 bail!(
@@ -201,10 +339,14 @@ impl Manager {
         self.set_state(name, Some(VmState::Starting), None).await;
         let result = self.boot(&record, &dir).await;
         match &result {
-            Ok(()) => self.set_state(name, None, None).await,
+            Ok(()) => {
+                self.touch(name);
+                self.set_state(name, None, None).await
+            }
             Err(e) => {
                 if let Some(l) = Launch::load(&dir) {
                     backend::signal(l.pid, libc::SIGKILL);
+                    l.stop_helpers();
                 }
                 Launch::clear(&dir);
                 self.set_state(name, None, Some(format!("{e:#}"))).await;
@@ -216,16 +358,38 @@ impl Manager {
     }
 
     async fn boot(&self, record: &VmRecord, dir: &Path) -> Result<()> {
-        if record.spec.backend != backend::HOST {
+        let mut opts = backend::LaunchOptions::default();
+        let mut net_guard = None;
+        if record.spec.backend == backend::CLOUD_HYPERVISOR {
+            opts.firmware = Some(match crate::chv::firmware(&self.paths) {
+                Some(f) => f,
+                None => image::pull_firmware(&self.paths).await?,
+            });
+        }
+        if record.spec.backend == backend::GVISOR {
+            opts.guest_binary = Some(backend::guest_binary(&self.paths)?);
+        }
+        let vm = record.spec.backend == backend::CLOUD_HYPERVISOR
+            || record.spec.backend == backend::VFKIT;
+        let routed = record.spec.backend == backend::CLOUD_HYPERVISOR
+            || record.spec.backend == backend::GVISOR;
+        if routed && record.spec.network == Network::Full {
+            net_guard = Some(self.net_lock.lock().await);
+            opts.net = Some(crate::chv::free_slot(&self.net_slots_in_use())?);
+        }
+        if vm {
             let agent = backend::guest_binary(&self.paths)?;
+            let network = opts.net.map(|n| n.network_config());
             seed::build(
                 &dir.join("seed.img"),
                 &record.instance_id,
                 &record.spec.name,
                 &agent,
+                network.as_deref(),
             )?;
         }
-        let launch = backend::launch(record, dir)?;
+        let launch = backend::launch(record, dir, &opts)?;
+        drop(net_guard);
         let deadline = tokio::time::Instant::now() + BOOT_TIMEOUT;
         loop {
             if !launch.alive() {
@@ -250,7 +414,8 @@ impl Manager {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        if record.spec.backend != backend::HOST {
+        // Real VMs mount their virtio-fs shares; gVisor's are bind mounts already.
+        if vm {
             for (i, m) in record.spec.mounts.iter().enumerate() {
                 launch
                     .guest
@@ -275,12 +440,20 @@ impl Manager {
         if let Some(launch) = Launch::load(&dir) {
             if launch.alive() {
                 self.set_state(name, Some(VmState::Stopping), None).await;
-                if record.spec.backend != backend::HOST {
-                    let _ = tokio::time::timeout(
+                if record.spec.backend == backend::GVISOR {
+                    crate::gvisor::halt(name, &dir, &launch).await;
+                } else if record.spec.backend != backend::HOST {
+                    let asked = tokio::time::timeout(
                         Duration::from_secs(5),
                         launch.guest.call(&Request::Shutdown),
                     )
                     .await;
+                    // The agent didn't answer: press the power button instead.
+                    if !matches!(asked, Ok(Ok(_)))
+                        && record.spec.backend == backend::CLOUD_HYPERVISOR
+                    {
+                        let _ = crate::chv::power_button(&dir).await;
+                    }
                 } else {
                     backend::signal(launch.pid, libc::SIGTERM);
                 }
@@ -296,8 +469,10 @@ impl Manager {
                     backend::signal(launch.pid, libc::SIGKILL);
                 }
             }
+            launch.stop_helpers();
             Launch::clear(&dir);
         }
+        self.activity.lock().unwrap().remove(name);
         self.set_state(name, None, None).await;
         drop(_guard);
         let status = self.status(name).await?;
@@ -315,6 +490,7 @@ impl Manager {
         }
         let lock = self.lock(name).await;
         let _guard = lock.lock().await;
+        crate::gvisor::release_mounts(&dir);
         std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
         self.live.lock().await.remove(name);
         Ok(())
@@ -351,6 +527,13 @@ impl Manager {
         if src_dir.join("disk.raw").is_file() {
             std::fs::copy(src_dir.join("disk.raw"), dir.join("disk.raw"))?;
         }
+        let rootfs = crate::gvisor::rootfs(&src_dir);
+        if rootfs.is_dir() {
+            if let Err(e) = crate::gvisor::copy_tree(&rootfs, &crate::gvisor::rootfs(&dir)) {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(e);
+            }
+        }
         let mut record = src.clone();
         record.spec.name = to.to_string();
         record.created_at = crate::now();
@@ -377,8 +560,14 @@ impl Manager {
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let host_port = listener.local_addr()?.port();
+        let manager = Arc::downgrade(self);
+        let vm = name.to_string();
         let task = tokio::spawn(async move {
             while let Ok((mut conn, _)) = listener.accept().await {
+                // Someone looking at a preview is using the VM.
+                if let Some(m) = manager.upgrade() {
+                    m.touch(&vm);
+                }
                 let guest = guest.clone();
                 tokio::spawn(async move {
                     let _ = conn.set_nodelay(true);
@@ -419,6 +608,20 @@ impl Manager {
     }
 }
 
+/// Keeps a stream counted as open; see [`Manager::stream_opened`].
+pub struct StreamGuard {
+    manager: Weak<Manager>,
+    name: String,
+}
+
+impl Drop for StreamGuard {
+    fn drop(&mut self) {
+        if let Some(m) = self.manager.upgrade() {
+            m.stream_closed(&self.name);
+        }
+    }
+}
+
 /// Open a raw TCP pipe to a guest port.
 pub async fn open_tcp(guest: &GuestAddr, port: u16) -> Result<crate::guest::GuestStream> {
     let mut s = guest.open(&Request::Tcp { port }).await?;
@@ -455,4 +658,34 @@ fn clone_disk(base: &Path, target: &Path, disk_gb: u64) -> Result<()> {
         file.set_len(want)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIN: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn idle_needs_quiet_streams_and_procs() {
+        assert!(idle_expired(10 * MIN, 10 * MIN, 0, 0));
+        assert!(idle_expired(10 * MIN, 11 * MIN, 0, 0));
+        assert!(!idle_expired(10 * MIN, 9 * MIN, 0, 0));
+        // An open shell or a running agent keeps the VM up however long it's quiet.
+        assert!(!idle_expired(10 * MIN, 60 * MIN, 1, 0));
+        assert!(!idle_expired(10 * MIN, 60 * MIN, 0, 1));
+    }
+
+    #[test]
+    fn streams_count_until_dropped() {
+        let home = tempfile::tempdir().unwrap();
+        let m = Manager::new(Paths::at(home.path())).unwrap();
+        let guard = m.stream_opened("a");
+        let second = m.stream_opened("a");
+        assert_eq!(m.activity.lock().unwrap()["a"].streams, 2);
+        drop(guard);
+        drop(second);
+        assert_eq!(m.activity.lock().unwrap()["a"].streams, 0);
+        assert!(m.activity.lock().unwrap()["a"].last.elapsed() < MIN);
+    }
 }

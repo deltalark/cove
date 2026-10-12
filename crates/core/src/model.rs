@@ -33,6 +33,53 @@ pub struct VmSpec {
     /// isolation at all). Empty picks the platform default.
     #[serde(default)]
     pub backend: String,
+    /// Whether the VM gets a network device. Records saved before this existed load
+    /// as `full`.
+    #[serde(default)]
+    pub network: Network,
+    /// Stop the VM after this many minutes without exec, stream or named-process
+    /// activity. `None` keeps it running until stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_stop_minutes: Option<u64>,
+}
+
+/// A VM's network policy.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Network {
+    /// NAT to the host's network and the internet.
+    #[default]
+    Full,
+    /// No network device at all. The guest agent still works over vsock.
+    Off,
+}
+
+impl Network {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Network::Full => "full",
+            Network::Off => "off",
+        }
+    }
+}
+
+impl std::fmt::Display for Network {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Network {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "full" => Ok(Network::Full),
+            "off" => Ok(Network::Off),
+            other => Err(format!(
+                "unknown network policy {other:?} (use full or off)"
+            )),
+        }
+    }
 }
 
 pub fn default_image() -> String {
@@ -80,6 +127,10 @@ pub struct VmStatus {
     pub mounts: Vec<Mount>,
     pub ephemeral: bool,
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub network: Network,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_stop_minutes: Option<u64>,
     pub created_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -93,4 +144,30 @@ pub struct Forward {
     pub guest_port: u16,
     pub host_port: u16,
     pub url: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_records_load_with_full_network() {
+        let old = r#"{"name":"a","image":"debian-13","cpus":2,"memory_mb":4096,"disk_gb":20,
+            "mounts":[],"ephemeral":false,"tags":[],"backend":"vfkit",
+            "created_at":1,"instance_id":"a-1"}"#;
+        let record: VmRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(record.spec.network, Network::Full);
+        assert_eq!(record.spec.idle_stop_minutes, None);
+    }
+
+    #[test]
+    fn network_policy_text() {
+        assert_eq!("off".parse::<Network>(), Ok(Network::Off));
+        assert!("none".parse::<Network>().is_err());
+        assert_eq!(serde_json::to_string(&Network::Full).unwrap(), r#""full""#);
+        let spec: VmSpec =
+            serde_json::from_str(r#"{"name":"a","network":"off","idle_stop_minutes":15}"#).unwrap();
+        assert_eq!(spec.network, Network::Off);
+        assert_eq!(spec.idle_stop_minutes, Some(15));
+    }
 }

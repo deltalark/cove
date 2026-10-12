@@ -32,6 +32,10 @@ struct Output {
     buffered: usize,
     readers_open: usize,
     exit: Option<(Option<i32>, Option<i32>)>,
+    /// Exec streams have exactly one reader and must not lose a byte (git packs go
+    /// through them), so output is freed once sent and the process waits for a slow
+    /// reader instead of dropping old output. Named processes keep a replay buffer.
+    hold: bool,
 }
 
 pub struct Proc {
@@ -76,8 +80,25 @@ fn with_defaults(command: &Command) -> Vec<(String, String)> {
 }
 
 impl Proc {
+    /// Start `command` for one exec stream: unregistered, and its output waits for
+    /// the reader rather than being dropped; see [`Proc::release`].
+    pub fn exec(command: &Command) -> Result<Arc<Proc>, String> {
+        Self::launch("", command, true)
+    }
+
+    /// The exec stream's reader is gone: stop holding output for it, so nothing
+    /// waits on a reader that will never come back.
+    pub fn release(&self) {
+        self.out.lock().unwrap().hold = false;
+        self.changed.notify_all();
+    }
+
     /// Start `command`. The process is not registered; see [`spawn`].
     pub fn start(name: &str, command: &Command) -> Result<Arc<Proc>, String> {
+        Self::launch(name, command, false)
+    }
+
+    fn launch(name: &str, command: &Command, hold: bool) -> Result<Arc<Proc>, String> {
         if command.cmd.is_empty() {
             return Err("empty command".into());
         }
@@ -87,12 +108,12 @@ impl Proc {
             }
         }
         match command.pty {
-            Some(size) => Self::start_pty(name, command, size),
-            None => Self::start_piped(name, command),
+            Some(size) => Self::start_pty(name, command, size, hold),
+            None => Self::start_piped(name, command, hold),
         }
     }
 
-    fn new(name: &str, command: &Command, pid: Option<u32>, readers: usize) -> Proc {
+    fn new(name: &str, command: &Command, pid: Option<u32>, readers: usize, hold: bool) -> Proc {
         Proc {
             name: name.to_string(),
             cmd: command.cmd.clone(),
@@ -100,6 +121,7 @@ impl Proc {
             started_at: now(),
             out: Mutex::new(Output {
                 readers_open: readers,
+                hold,
                 ..Default::default()
             }),
             changed: Condvar::new(),
@@ -108,7 +130,7 @@ impl Proc {
         }
     }
 
-    fn start_piped(name: &str, command: &Command) -> Result<Arc<Proc>, String> {
+    fn start_piped(name: &str, command: &Command, hold: bool) -> Result<Arc<Proc>, String> {
         use std::os::unix::process::CommandExt;
         use std::process::Stdio;
         let mut cmd = std::process::Command::new(&command.cmd[0]);
@@ -125,7 +147,7 @@ impl Proc {
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("could not start {:?}: {e}", command.cmd[0]))?;
-        let proc = Arc::new(Self::new(name, command, Some(child.id()), 2));
+        let proc = Arc::new(Self::new(name, command, Some(child.id()), 2, hold));
         *proc.stdin.lock().unwrap() = child
             .stdin
             .take()
@@ -143,7 +165,12 @@ impl Proc {
         Ok(proc)
     }
 
-    fn start_pty(name: &str, command: &Command, size: PtySize) -> Result<Arc<Proc>, String> {
+    fn start_pty(
+        name: &str,
+        command: &Command,
+        size: PtySize,
+        hold: bool,
+    ) -> Result<Arc<Proc>, String> {
         let system = portable_pty::native_pty_system();
         let pair = system
             .openpty(portable_pty::PtySize {
@@ -168,7 +195,7 @@ impl Proc {
         drop(pair.slave);
         let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
         let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
-        let proc = Arc::new(Self::new(name, command, child.process_id(), 1));
+        let proc = Arc::new(Self::new(name, command, child.process_id(), 1, hold));
         *proc.stdin.lock().unwrap() = Some(writer);
         *proc.pty.lock().unwrap() = Some(pair.master);
         pump(&proc, reader, STDOUT);
@@ -182,6 +209,15 @@ impl Proc {
 
     fn push(&self, stream: u8, data: &[u8]) {
         let mut out = self.out.lock().unwrap();
+        // Backpressure: the pipe fills and the process blocks until the reader
+        // catches up.
+        while out.hold && out.buffered >= BUFFER_LIMIT {
+            out = self
+                .changed
+                .wait_timeout(out, Duration::from_millis(100))
+                .unwrap()
+                .0;
+        }
         let offset = out.total;
         out.total += data.len() as u64;
         out.buffered += data.len();
@@ -190,7 +226,7 @@ impl Proc {
             offset,
             data: data.to_vec(),
         });
-        while out.buffered > BUFFER_LIMIT && out.chunks.len() > 1 {
+        while !out.hold && out.buffered > BUFFER_LIMIT && out.chunks.len() > 1 {
             let dropped = out.chunks.pop_front().unwrap();
             out.buffered -= dropped.data.len();
             out.base = dropped.offset + dropped.data.len() as u64;
@@ -205,16 +241,25 @@ impl Proc {
     }
 
     /// Record the exit once the output readers have drained, so `Exit` is always the
-    /// last frame. A grandchild holding the pipe open can't stall this for long.
+    /// last frame. A grandchild holding the pipe open can't stall this for long, but
+    /// output still arriving, or waiting on a slow reader, can.
     fn finish(&self, code: Option<i32>, signal: Option<i32>) {
         let mut out = self.out.lock().unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while out.readers_open > 0 && std::time::Instant::now() < deadline {
+        let grace = Duration::from_secs(2);
+        let mut deadline = std::time::Instant::now() + grace;
+        let mut seen = out.total;
+        while out.readers_open > 0
+            && (std::time::Instant::now() < deadline || (out.hold && out.buffered >= BUFFER_LIMIT))
+        {
             out = self
                 .changed
                 .wait_timeout(out, Duration::from_millis(100))
                 .unwrap()
                 .0;
+            if out.total != seen {
+                seen = out.total;
+                deadline = std::time::Instant::now() + grace;
+            }
         }
         out.exit = Some((code, signal));
         self.changed.notify_all();
@@ -321,6 +366,19 @@ impl Proc {
                     });
                     from = end;
                 }
+                if out.hold {
+                    // The only reader has these now; let the process go on.
+                    while out
+                        .chunks
+                        .front()
+                        .is_some_and(|c| c.offset + c.data.len() as u64 <= from)
+                    {
+                        let sent = out.chunks.pop_front().unwrap();
+                        out.buffered -= sent.data.len();
+                        out.base = sent.offset + sent.data.len() as u64;
+                    }
+                    self.changed.notify_all();
+                }
                 if let Some((code, signal)) = out.exit {
                     if from >= out.total {
                         done = Some(Frame::Exit { code, signal });
@@ -394,4 +452,56 @@ pub fn kill(name: &str, signal: i32) -> bool {
         procs.remove(name);
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sh(script: &str) -> Command {
+        Command {
+            cmd: vec!["sh".into(), "-c".into(), script.into()],
+            ..Default::default()
+        }
+    }
+
+    /// More output than the replay buffer holds, read slowly, arrives whole.
+    #[test]
+    fn exec_output_waits_for_a_slow_reader() {
+        let size = BUFFER_LIMIT as u64 + 4 * 1024 * 1024;
+        let proc = Proc::exec(&sh(&format!("head -c {size} /dev/zero"))).unwrap();
+        // Let the process fill the buffer before anyone reads.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            proc.running(),
+            "the process should be waiting for its reader"
+        );
+        let mut got = 0u64;
+        let mut exit = None;
+        proc.follow(0, &|| true, &mut |f| {
+            match f {
+                Frame::Stdout { data, offset } => {
+                    assert_eq!(offset, got);
+                    got += data.0.len() as u64;
+                }
+                Frame::Truncated { .. } => panic!("output was dropped"),
+                Frame::Exit { code, .. } => exit = Some(code),
+                _ => {}
+            }
+            true
+        });
+        assert_eq!(got, size);
+        assert_eq!(exit, Some(Some(0)));
+    }
+
+    #[test]
+    fn released_exec_does_not_block() {
+        let proc = Proc::exec(&sh("head -c 40000000 /dev/zero")).unwrap();
+        proc.release();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while proc.running() {
+            assert!(std::time::Instant::now() < deadline, "still blocked");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 }

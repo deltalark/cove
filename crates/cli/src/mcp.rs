@@ -3,7 +3,8 @@
 
 use crate::client::Client;
 use anyhow::{anyhow, Result};
-use cove_core::VmStatus;
+use cove_core::{VmState, VmStatus};
+use cove_proto::{Frame, ProcInfo, Request};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -37,7 +38,8 @@ pub async fn handle(client: &Client, request: &Value) -> Option<Value> {
             "capabilities": { "tools": {} },
             "serverInfo": { "name": "cove", "version": env!("CARGO_PKG_VERSION") },
             "instructions": "Linux VMs you can create, run commands in, and preview web apps from. \
-                VMs are isolated from the user's machine. Use vm_exec to run shell commands."
+                VMs are isolated from the user's machine. Use vm_exec to run shell commands, and \
+                vm_spawn with vm_logs for long jobs and servers that should keep running."
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tools() })),
@@ -62,6 +64,7 @@ pub async fn handle(client: &Client, request: &Value) -> Option<Value> {
 
 fn tools() -> Value {
     let name = json!({ "type": "string", "description": "VM name" });
+    let proc = json!({ "type": "string", "description": "process name, unique per VM" });
     json!([
         {
             "name": "vm_list",
@@ -75,7 +78,9 @@ fn tools() -> Value {
                 "name": { "type": "string", "description": "lowercase letters, digits and dashes" },
                 "cpus": { "type": "integer" },
                 "memory_mb": { "type": "integer" },
-                "ephemeral": { "type": "boolean", "description": "delete it when stopped" }
+                "ephemeral": { "type": "boolean", "description": "delete it when stopped" },
+                "network": { "type": "string", "enum": ["full", "off"], "description": "full (default) or off: no network at all, for untrusted code" },
+                "idle_stop_minutes": { "type": "integer", "description": "stop the VM after this many idle minutes" }
             }}
         },
         {
@@ -85,6 +90,34 @@ fn tools() -> Value {
                 "name": name,
                 "command": { "type": "string" },
                 "cwd": { "type": "string" }
+            }}
+        },
+        {
+            "name": "vm_spawn",
+            "description": "Start a named background process in a VM (bash -lc). It keeps running after this call returns; read its output with vm_logs.",
+            "inputSchema": { "type": "object", "required": ["name", "proc", "command"], "properties": {
+                "name": name,
+                "proc": proc,
+                "command": { "type": "string" },
+                "cwd": { "type": "string" }
+            }}
+        },
+        {
+            "name": "vm_logs",
+            "description": "Return a named process's output so far, without waiting, and whether it is still running. Pass the returned next offset as `from` to get only newer output.",
+            "inputSchema": { "type": "object", "required": ["name", "proc"], "properties": {
+                "name": name,
+                "proc": proc,
+                "from": { "type": "integer", "description": "byte offset to start from (default 0)" }
+            }}
+        },
+        {
+            "name": "vm_kill",
+            "description": "Signal a named process (SIGTERM by default). Killing one that already exited forgets it.",
+            "inputSchema": { "type": "object", "required": ["name", "proc"], "properties": {
+                "name": name,
+                "proc": proc,
+                "signal": { "type": "integer", "description": "signal number, e.g. 9 for SIGKILL" }
             }}
         },
         {
@@ -106,6 +139,24 @@ fn tools() -> Value {
             "description": "Make a port a server in the VM listens on reachable from the user's machine; returns the URL.",
             "inputSchema": { "type": "object", "required": ["name", "port"], "properties": {
                 "name": name, "port": { "type": "integer" }
+            }}
+        },
+        {
+            "name": "vm_stop",
+            "description": "Stop a VM to free its CPU and memory. Its disk is kept unless it is ephemeral; vm_start boots it again.",
+            "inputSchema": { "type": "object", "required": ["name"], "properties": { "name": name } }
+        },
+        {
+            "name": "vm_start",
+            "description": "Start a stopped VM.",
+            "inputSchema": { "type": "object", "required": ["name"], "properties": { "name": name } }
+        },
+        {
+            "name": "vm_copy",
+            "description": "Copy a stopped VM (disk and settings) to a new VM, e.g. to try something risky on a copy.",
+            "inputSchema": { "type": "object", "required": ["name", "to"], "properties": {
+                "name": name,
+                "to": { "type": "string", "description": "name for the copy" }
             }}
         },
         {
@@ -152,7 +203,13 @@ async fn call(client: &Client, tool: &str, args: &Value) -> Result<String> {
         }
         "vm_create" => {
             let mut body = json!({ "name": arg(args, "name")? });
-            for key in ["cpus", "memory_mb", "ephemeral"] {
+            for key in [
+                "cpus",
+                "memory_mb",
+                "ephemeral",
+                "network",
+                "idle_stop_minutes",
+            ] {
                 if !args[key].is_null() {
                     body[key] = args[key].clone();
                 }
@@ -183,6 +240,61 @@ async fn call(client: &Client, tool: &str, args: &Value) -> Result<String> {
                 text.push_str(&format!("stderr:\n{}\n", clip(stderr)));
             }
             Ok(text)
+        }
+        "vm_spawn" => {
+            let name = arg(args, "name")?;
+            let proc = arg(args, "proc")?;
+            let request = Request::Spawn {
+                name: proc.to_string(),
+                command: cove_proto::Command {
+                    cmd: vec!["bash".into(), "-lc".into(), arg(args, "command")?.into()],
+                    cwd: args["cwd"].as_str().map(String::from),
+                    ..Default::default()
+                },
+            };
+            // The process outlives the stream, so read the reply and hang up.
+            let mut stream = client.stream(name, &request).await?;
+            match stream.next().await? {
+                Some(Frame::Ok { .. }) => Ok(format!(
+                    "Started {proc} in {name}. Read its output with vm_logs."
+                )),
+                Some(Frame::Error { message }) => Err(anyhow!(message)),
+                other => Err(anyhow!("unexpected reply: {other:?}")),
+            }
+        }
+        "vm_logs" => {
+            let name = arg(args, "name")?;
+            let proc = arg(args, "proc")?;
+            let from = args["from"].as_u64().unwrap_or(0);
+            logs(client, name, proc, from).await
+        }
+        "vm_kill" => {
+            let name = arg(args, "name")?;
+            let proc = arg(args, "proc")?;
+            let path = match args["signal"].as_i64() {
+                Some(s) => format!("/vms/{name}/procs/{proc}?signal={s}"),
+                None => format!("/vms/{name}/procs/{proc}"),
+            };
+            let _: Value = client.delete(&path).await?;
+            Ok(format!("Signalled {proc}."))
+        }
+        "vm_stop" => {
+            let name = arg(args, "name")?;
+            let vm: VmStatus = client.post(&format!("/vms/{name}/stop"), &()).await?;
+            Ok(format!("VM {} is {}.", vm.name, state_text(vm.state)))
+        }
+        "vm_start" => {
+            let name = arg(args, "name")?;
+            let vm: VmStatus = client.post(&format!("/vms/{name}/start"), &()).await?;
+            Ok(format!("VM {} is {}.", vm.name, state_text(vm.state)))
+        }
+        "vm_copy" => {
+            let name = arg(args, "name")?;
+            let to = arg(args, "to")?;
+            let vm: VmStatus = client
+                .post(&format!("/vms/{name}/copy"), &json!({ "to": to }))
+                .await?;
+            Ok(format!("Copied {name} to {} (stopped).", vm.name))
         }
         "vm_read_file" => {
             let data = client
@@ -221,5 +333,133 @@ async fn call(client: &Client, tool: &str, args: &Value) -> Result<String> {
             Ok(format!("Deleted {name}."))
         }
         other => Err(anyhow!("unknown tool {other}")),
+    }
+}
+
+fn state_text(state: VmState) -> String {
+    serde_json::to_value(state)
+        .ok()
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_default()
+}
+
+/// A named process's output from byte `from` up to what it had produced when asked.
+/// Attaching follows forever, so stop at that point (or after a few seconds) instead.
+async fn logs(client: &Client, vm: &str, proc: &str, from: u64) -> Result<String> {
+    let procs: Vec<ProcInfo> = client.get(&format!("/vms/{vm}/procs")).await?;
+    let info = procs
+        .into_iter()
+        .find(|p| p.name == proc)
+        .ok_or_else(|| anyhow!("no process named {proc:?}"))?;
+    let end = info.output_len;
+    let mut data = Vec::new();
+    let mut start = from.min(end);
+    let mut note = String::new();
+    if start < end {
+        let mut stream = client
+            .stream(
+                vm,
+                &Request::Attach {
+                    name: proc.to_string(),
+                    from: start,
+                },
+            )
+            .await?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while start + (data.len() as u64) < end && data.len() < MAX_OUTPUT {
+            let next = tokio::time::timeout_at(deadline, stream.next()).await;
+            match next {
+                Ok(Ok(Some(Frame::Stdout { data: d, .. } | Frame::Stderr { data: d, .. }))) => {
+                    data.extend(d.0)
+                }
+                Ok(Ok(Some(Frame::Truncated { offset }))) => {
+                    note = format!("(output before byte {offset} is no longer kept)\n");
+                    start = offset;
+                }
+                Ok(Ok(Some(Frame::Error { message }))) => return Err(anyhow!(message)),
+                Ok(Ok(Some(Frame::Exit { .. }))) | Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(Some(Frame::Ok { .. }))) => {}
+            }
+        }
+    }
+    let keep = keep_len(&data, (end.saturating_sub(start) as usize).min(MAX_OUTPUT));
+    data.truncate(keep);
+    let next = start + data.len() as u64;
+    let state = if info.running {
+        "is running".to_string()
+    } else {
+        match info.exit_code {
+            Some(c) => format!("exited with code {c}"),
+            None => "was killed".to_string(),
+        }
+    };
+    let more = if next < end {
+        format!(", {} more bytes", end - next)
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "{proc} {state}; output bytes {start}..{next}{more}. Next from: {next}\n{note}{}",
+        String::from_utf8_lossy(&data)
+    ))
+}
+
+/// How many of `data`'s bytes to return, at most `max`, without splitting a UTF-8
+/// character, so the next call's `from` starts on a character boundary.
+fn keep_len(data: &[u8], max: usize) -> usize {
+    let mut end = data.len().min(max);
+    if end == data.len() {
+        return end;
+    }
+    let floor = end.saturating_sub(3);
+    while end > floor && end < data.len() && (data[end] & 0b1100_0000) == 0b1000_0000 {
+        end -= 1;
+    }
+    end
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tools_are_listed() {
+        let tools = tools();
+        let names: Vec<&str> = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        for t in [
+            "vm_create",
+            "vm_spawn",
+            "vm_logs",
+            "vm_kill",
+            "vm_stop",
+            "vm_start",
+            "vm_copy",
+        ] {
+            assert!(names.contains(&t), "{t} missing");
+        }
+        let create = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "vm_create")
+            .unwrap();
+        assert_eq!(
+            create["inputSchema"]["properties"]["network"]["enum"],
+            json!(["full", "off"])
+        );
+    }
+
+    #[test]
+    fn logs_cut_on_character_boundaries() {
+        let text = "aé".as_bytes(); // 'é' is two bytes
+        assert_eq!(keep_len(text, 10), 3);
+        assert_eq!(keep_len(text, 3), 3);
+        assert_eq!(keep_len(text, 2), 1);
+        assert_eq!(keep_len(b"abc", 2), 2);
     }
 }

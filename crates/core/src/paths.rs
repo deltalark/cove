@@ -10,6 +10,7 @@
 //! vms/<name>/run.json     how to reach the running VM (pid, guest address)
 //! vms/<name>/console.log  serial console
 //! guest/cove-guest-<arch>  guest agent binaries copied into VMs
+//! firmware/CLOUDHV*.fd    cloud-hypervisor's EFI firmware (Linux)
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -56,6 +57,9 @@ impl Paths {
     }
     pub fn guest_dir(&self) -> PathBuf {
         self.root.join("guest")
+    }
+    pub fn firmware_dir(&self) -> PathBuf {
+        self.root.join("firmware")
     }
 
     pub fn ensure(&self) -> std::io::Result<()> {

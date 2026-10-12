@@ -4,7 +4,7 @@
 //! not stop them; the server finds them again from `run.json`.
 
 use crate::guest::GuestAddr;
-use crate::model::VmRecord;
+use crate::model::{Network, VmRecord};
 use crate::paths::Paths;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -14,22 +14,66 @@ use std::process::Stdio;
 pub const HOST: &str = "host";
 pub const VFKIT: &str = "vfkit";
 pub const CLOUD_HYPERVISOR: &str = "cloud-hypervisor";
+pub const GVISOR: &str = "gvisor";
 
-pub fn platform_default() -> &'static str {
+/// The backends this platform has, best first (`host` is for development only).
+pub fn platform_backends() -> &'static [&'static str] {
     if cfg!(target_os = "macos") {
-        VFKIT
+        &[VFKIT]
     } else {
-        CLOUD_HYPERVISOR
+        &[CLOUD_HYPERVISOR, GVISOR]
     }
+}
+
+/// The platform's main backend, for messages and `cove doctor`.
+pub fn platform_default() -> &'static str {
+    platform_backends()[0]
+}
+
+/// What `auto` picks: Apple's VMs on a Mac; on Linux, cloud-hypervisor when KVM is
+/// usable and it is installed, else gVisor when installed, else cloud-hypervisor if
+/// there is KVM (so the error says what to install), else nothing.
+pub fn choose_auto(
+    macos: bool,
+    kvm: bool,
+    cloud_hypervisor: bool,
+    runsc: bool,
+) -> std::result::Result<&'static str, String> {
+    if macos {
+        return Ok(VFKIT);
+    }
+    match (kvm, cloud_hypervisor, runsc) {
+        (true, true, _) => Ok(CLOUD_HYPERVISOR),
+        (_, _, true) => Ok(GVISOR),
+        (true, false, false) => Ok(CLOUD_HYPERVISOR),
+        (false, _, false) => Err(
+            "this machine has no KVM, so Cove needs gVisor to run VMs here: install it with \
+             scripts/install.sh, or see https://gvisor.dev/docs/user_guide/install/"
+                .into(),
+        ),
+    }
+}
+
+/// The backend `auto` picks on this machine.
+pub fn auto() -> std::result::Result<&'static str, String> {
+    choose_auto(
+        cfg!(target_os = "macos"),
+        crate::chv::kvm_check(Path::new("/dev/kvm")).is_ok(),
+        which("cloud-hypervisor").is_some(),
+        which("runsc").is_some(),
+    )
 }
 
 pub fn resolve(requested: &str) -> Result<&'static str> {
     Ok(match requested {
-        "" => platform_default(),
+        "" | "auto" => auto().map_err(anyhow::Error::msg)?,
         HOST => HOST,
         VFKIT => VFKIT,
         CLOUD_HYPERVISOR => CLOUD_HYPERVISOR,
-        other => bail!("unknown backend {other:?} (use vfkit, cloud-hypervisor or host)"),
+        GVISOR => GVISOR,
+        other => {
+            bail!("unknown backend {other:?} (use auto, vfkit, cloud-hypervisor, gvisor or host)")
+        }
     })
 }
 
@@ -61,10 +105,22 @@ pub fn check(backend: &str) -> std::result::Result<String, String> {
                 None => Err("vfkit is not installed: brew install vfkit".into()),
             }
         }
-        CLOUD_HYPERVISOR => Err(
-            "the Linux backend (cloud-hypervisor) is not built yet; it is step 4 of the plan"
-                .into(),
-        ),
+        CLOUD_HYPERVISOR => {
+            if !cfg!(target_os = "linux") {
+                return Err("cloud-hypervisor runs on Linux only".into());
+            }
+            crate::chv::kvm_check(Path::new("/dev/kvm"))?;
+            match which("cloud-hypervisor") {
+                Some(p) => Ok(format!("cloud-hypervisor at {}", p.display())),
+                None => Err(
+                    "cloud-hypervisor is not installed: download cloud-hypervisor-static \
+                     from https://github.com/cloud-hypervisor/cloud-hypervisor/releases into \
+                     /usr/local/bin/cloud-hypervisor (scripts/install.sh does this)"
+                        .into(),
+                ),
+            }
+        }
+        GVISOR => crate::gvisor::check(),
         other => Err(format!("unknown backend {other:?}")),
     }
 }
@@ -72,8 +128,19 @@ pub fn check(backend: &str) -> std::result::Result<String, String> {
 pub fn which(program: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     let mut dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
-    // Homebrew isn't on PATH for launchd services.
-    dirs.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
+    // Homebrew isn't on PATH for launchd services, sbin often isn't for other users,
+    // and Debian and Ubuntu install virtiofsd outside PATH.
+    dirs.extend(
+        [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/sbin",
+            "/sbin",
+            "/usr/libexec",
+            "/usr/lib/qemu",
+        ]
+        .map(PathBuf::from),
+    );
     dirs.into_iter()
         .map(|d| d.join(program))
         .find(|p| p.is_file())
@@ -85,6 +152,12 @@ pub struct Launch {
     pub pid: u32,
     pub guest: GuestAddr,
     pub started_at: u64,
+    /// Helper processes that live as long as the VM (virtiofsd), stopped with it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub helpers: Vec<u32>,
+    /// cloud-hypervisor: the VM's network slot, so no other VM takes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net: Option<u32>,
 }
 
 impl Launch {
@@ -104,6 +177,15 @@ impl Launch {
 
     pub fn alive(&self) -> bool {
         pid_alive(self.pid)
+    }
+
+    /// Clean up after the VM: stop helpers (they exit by themselves when the VM does,
+    /// but don't rely on it) and remove a gVisor sandbox's network namespace.
+    pub fn stop_helpers(&self) {
+        crate::chv::stop_helpers(&self.helpers);
+        if let (Some(slot), GuestAddr::Unix { .. }) = (self.net, &self.guest) {
+            crate::gvisor::teardown_netns(crate::chv::NetSlot(slot));
+        }
     }
 }
 
@@ -170,7 +252,7 @@ fn detach(cmd: &mut std::process::Command) {
 }
 
 /// Spawn and reap in the background so a finished VM doesn't linger as a zombie.
-fn spawn_detached(mut cmd: std::process::Command) -> Result<u32> {
+pub(crate) fn spawn_detached(mut cmd: std::process::Command) -> Result<u32> {
     detach(&mut cmd);
     let mut child = cmd
         .spawn()
@@ -187,10 +269,21 @@ fn free_port() -> Result<u16> {
     Ok(l.local_addr()?.port())
 }
 
+/// What a backend needs beyond the record. Only cloud-hypervisor uses these.
+#[derive(Debug, Default, Clone)]
+pub struct LaunchOptions {
+    pub firmware: Option<PathBuf>,
+    pub net: Option<crate::chv::NetSlot>,
+    /// gVisor: the agent binary, bind-mounted into the sandbox.
+    pub guest_binary: Option<PathBuf>,
+}
+
 /// Boot the VM. Disks and the seed already exist in `vm_dir`.
-pub fn launch(record: &VmRecord, vm_dir: &Path) -> Result<Launch> {
+pub fn launch(record: &VmRecord, vm_dir: &Path, opts: &LaunchOptions) -> Result<Launch> {
     let log = std::fs::File::create(vm_dir.join("backend.log"))?;
     let launch = match record.spec.backend.as_str() {
+        // The dev backend runs the agent as a plain host process, so it shares the
+        // host's network whatever `network` says; only real VMs enforce the policy.
         HOST => {
             for m in &record.spec.mounts {
                 if m.host != m.guest {
@@ -211,6 +304,8 @@ pub fn launch(record: &VmRecord, vm_dir: &Path) -> Result<Launch> {
                     addr: format!("127.0.0.1:{port}"),
                 },
                 started_at: crate::now(),
+                helpers: vec![],
+                net: None,
             }
         }
         VFKIT => {
@@ -225,7 +320,65 @@ pub fn launch(record: &VmRecord, vm_dir: &Path) -> Result<Launch> {
                 pid: spawn_detached(cmd)?,
                 guest: GuestAddr::Unix { path: socket },
                 started_at: crate::now(),
+                helpers: vec![],
+                net: None,
             }
+        }
+        CLOUD_HYPERVISOR => {
+            let program = which("cloud-hypervisor")
+                .context("cloud-hypervisor is not installed (see cove doctor)")?;
+            let firmware = opts
+                .firmware
+                .clone()
+                .context("no cloud-hypervisor firmware (see cove doctor)")?;
+            // cloud-hypervisor binds these itself, within the ~100-byte socket limit.
+            if vm_dir.join("vsock.sock").as_os_str().len() > 100 {
+                bail!(
+                    "{} is too deep for cloud-hypervisor's sockets; use a shorter COVE_HOME",
+                    vm_dir.display()
+                );
+            }
+            for stale in ["vsock.sock", "api.sock"] {
+                let _ = std::fs::remove_file(vm_dir.join(stale));
+            }
+            let net = match record.spec.network {
+                Network::Full => {
+                    crate::chv::setup_nat()?;
+                    Some(opts.net.context("no network slot for this VM")?)
+                }
+                Network::Off => None,
+            };
+            let helpers = crate::chv::start_virtiofsd(record, vm_dir, &log)?;
+            let mut cmd = std::process::Command::new(program);
+            cmd.args(crate::chv::cloud_hypervisor_args(
+                record, vm_dir, &firmware, net,
+            ))
+            .stdout(log.try_clone()?)
+            .stderr(log);
+            let pid = match spawn_detached(cmd) {
+                Ok(pid) => pid,
+                Err(e) => {
+                    crate::chv::stop_helpers(&helpers);
+                    return Err(e);
+                }
+            };
+            Launch {
+                pid,
+                guest: GuestAddr::HybridVsock {
+                    path: vm_dir.join("vsock.sock"),
+                    port: cove_proto::GUEST_PORT,
+                },
+                started_at: crate::now(),
+                helpers,
+                net: net.map(|n| n.0),
+            }
+        }
+        GVISOR => {
+            let guest = opts
+                .guest_binary
+                .clone()
+                .context("no guest agent for the sandbox")?;
+            crate::gvisor::launch(record, vm_dir, &guest, opts.net, &log)?
         }
         other => bail!(check(other)
             .err()
@@ -252,8 +405,14 @@ pub fn vfkit_args(record: &VmRecord, vm_dir: &Path) -> Vec<String> {
         format!("virtio-blk,path={}", d("disk.raw")),
         "--device".into(),
         format!("virtio-blk,path={}", d("seed.img")),
-        "--device".into(),
-        "virtio-net,nat".into(),
+    ];
+    // With the network off there is no NIC at all, not just no route: the guest
+    // agent talks over vsock, which needs none.
+    if record.spec.network == Network::Full {
+        args.push("--device".into());
+        args.push("virtio-net,nat".into());
+    }
+    args.extend([
         "--device".into(),
         format!(
             "virtio-vsock,port={},socketURL={},listen",
@@ -264,7 +423,7 @@ pub fn vfkit_args(record: &VmRecord, vm_dir: &Path) -> Vec<String> {
         "virtio-rng".into(),
         "--device".into(),
         format!("virtio-serial,logFilePath={}", d("console.log")),
-    ];
+    ]);
     for (i, m) in record.spec.mounts.iter().enumerate() {
         args.push("--device".into());
         args.push(format!(
@@ -298,6 +457,8 @@ mod tests {
                 ephemeral: false,
                 tags: vec![],
                 backend: VFKIT.into(),
+                network: Network::Full,
+                idle_stop_minutes: None,
             },
             created_at: 0,
             instance_id: "x".into(),
@@ -306,7 +467,92 @@ mod tests {
         assert!(args.starts_with(
             "--cpus 4 --memory 8192 --bootloader efi,variable-store=/vms/a/efi-vars,create"
         ));
+        assert!(args.contains("--device virtio-net,nat"));
         assert!(args.contains("--device virtio-vsock,port=1024,socketURL=/vms/a/guest.sock,listen"));
         assert!(args.ends_with("--device virtio-fs,sharedDir=/Users/me/app,mountTag=cove0"));
+    }
+
+    #[test]
+    fn vfkit_without_network() {
+        let record = VmRecord {
+            spec: VmSpec {
+                name: "a".into(),
+                image: "debian-13".into(),
+                cpus: 2,
+                memory_mb: 4096,
+                disk_gb: 20,
+                mounts: vec![],
+                ephemeral: false,
+                tags: vec![],
+                backend: VFKIT.into(),
+                network: Network::Off,
+                idle_stop_minutes: None,
+            },
+            created_at: 0,
+            instance_id: "x".into(),
+        };
+        let args = vfkit_args(&record, Path::new("/vms/a")).join(" ");
+        assert!(!args.contains("virtio-net"));
+        // The agent's channel is still there.
+        assert!(args.contains("virtio-vsock"));
+    }
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::*;
+
+    #[test]
+    fn run_json_round_trips_and_old_files_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let launch = Launch {
+            pid: 42,
+            guest: GuestAddr::HybridVsock {
+                path: dir.path().join("vsock.sock"),
+                port: 1024,
+            },
+            started_at: 7,
+            helpers: vec![43, 44],
+            net: Some(3),
+        };
+        launch.save(dir.path()).unwrap();
+        let back = Launch::load(dir.path()).unwrap();
+        assert_eq!(back.guest, launch.guest);
+        assert_eq!((back.helpers, back.net), (vec![43, 44], Some(3)));
+        // run.json from before helpers and network slots existed.
+        std::fs::write(
+            dir.path().join("run.json"),
+            r#"{"pid":1,"guest":{"kind":"unix","path":"/x"},"started_at":0}"#,
+        )
+        .unwrap();
+        let old = Launch::load(dir.path()).unwrap();
+        assert!(old.helpers.is_empty() && old.net.is_none());
+        Launch::clear(dir.path());
+        assert!(Launch::load(dir.path()).is_none());
+    }
+
+    #[test]
+    fn linux_defaults_to_cloud_hypervisor() {
+        if cfg!(target_os = "linux") {
+            assert_eq!(platform_default(), CLOUD_HYPERVISOR);
+            assert_eq!(platform_backends(), [CLOUD_HYPERVISOR, GVISOR]);
+        }
+        assert_eq!(resolve("gvisor").unwrap(), GVISOR);
+        assert!(resolve("qemu").is_err());
+        assert!(resolve("container").is_err());
+    }
+
+    #[test]
+    fn auto_picks_the_strongest_available() {
+        assert_eq!(choose_auto(true, false, false, false), Ok(VFKIT));
+        assert_eq!(choose_auto(false, true, true, true), Ok(CLOUD_HYPERVISOR));
+        assert_eq!(choose_auto(false, true, true, false), Ok(CLOUD_HYPERVISOR));
+        // No KVM (or KVM but no cloud-hypervisor): gVisor if it is there.
+        assert_eq!(choose_auto(false, false, true, true), Ok(GVISOR));
+        assert_eq!(choose_auto(false, true, false, true), Ok(GVISOR));
+        // KVM but nothing installed: cloud-hypervisor, so the error says to install it.
+        assert_eq!(choose_auto(false, true, false, false), Ok(CLOUD_HYPERVISOR));
+        let refused = choose_auto(false, false, false, false).unwrap_err();
+        assert!(refused.contains("gVisor"), "{refused}");
     }
 }

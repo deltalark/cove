@@ -34,13 +34,13 @@ impl GuestAddr {
                 Ok(Box::new(s))
             }
             GuestAddr::Unix { path } => {
-                let s = tokio::net::UnixStream::connect(path)
+                let s = connect_unix(path)
                     .await
                     .with_context(|| format!("connect {}", path.display()))?;
                 Ok(Box::new(s))
             }
             GuestAddr::HybridVsock { path, port } => {
-                let mut s = tokio::net::UnixStream::connect(path)
+                let mut s = connect_unix(path)
                     .await
                     .with_context(|| format!("connect {}", path.display()))?;
                 s.write_all(format!("CONNECT {port}\n").as_bytes()).await?;
@@ -121,6 +121,29 @@ impl GuestAddr {
     }
 }
 
+/// Unix socket paths are limited to about 100 bytes, which a deep `COVE_HOME` can
+/// exceed. On Linux, reach a long one through its folder's open descriptor instead.
+pub(crate) async fn connect_unix(
+    path: &std::path::Path,
+) -> std::io::Result<tokio::net::UnixStream> {
+    const MAX_PATH: usize = 100;
+    if cfg!(target_os = "linux") && path.as_os_str().len() > MAX_PATH {
+        if let (Some(dir), Some(name)) = (path.parent(), path.file_name()) {
+            let dir = std::fs::File::open(dir)?;
+            let short = PathBuf::from(format!(
+                "/proc/self/fd/{}",
+                std::os::fd::AsRawFd::as_raw_fd(&dir)
+            ))
+            .join(name);
+            // `dir` stays open until the connection is made.
+            let stream = tokio::net::UnixStream::connect(&short).await;
+            drop(dir);
+            return stream;
+        }
+    }
+    tokio::net::UnixStream::connect(path).await
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ExecOutput {
     pub code: Option<i32>,
@@ -139,5 +162,30 @@ mod lossy {
     }
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
         Ok(String::deserialize(d)?.into_bytes())
+    }
+}
+
+// The /proc/self/fd trick is Linux's; other systems never take that path.
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn long_socket_paths_still_connect() {
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir.path().join("a".repeat(60)).join("b".repeat(60));
+        std::fs::create_dir_all(&deep).unwrap();
+        let path = deep.join("guest.sock");
+        assert!(path.as_os_str().len() > 108);
+        // Bind through the same trick, since binding has the same limit.
+        let fd_dir = std::fs::File::open(&deep).unwrap();
+        let short = format!(
+            "/proc/self/fd/{}/guest.sock",
+            std::os::fd::AsRawFd::as_raw_fd(&fd_dir)
+        );
+        let listener = tokio::net::UnixListener::bind(&short).unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.is_ok() });
+        connect_unix(&path).await.unwrap();
+        assert!(accept.await.unwrap());
     }
 }

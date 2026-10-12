@@ -57,7 +57,15 @@ fn meta_data(instance_id: &str, hostname: &str) -> String {
     format!("instance-id: {instance_id}\nlocal-hostname: {hostname}\n")
 }
 
-pub fn build(path: &Path, instance_id: &str, hostname: &str, guest_binary: &Path) -> Result<()> {
+/// `network` is a cloud-init `network-config`, for backends without DHCP
+/// (cloud-hypervisor); without one the image's default (DHCP) applies.
+pub fn build(
+    path: &Path,
+    instance_id: &str,
+    hostname: &str,
+    guest_binary: &Path,
+    network: Option<&str>,
+) -> Result<()> {
     let binary = std::fs::read(guest_binary)
         .with_context(|| format!("reading the guest agent at {}", guest_binary.display()))?;
     let tmp = path.with_extension("img.partial");
@@ -77,11 +85,15 @@ pub fn build(path: &Path, instance_id: &str, hostname: &str, guest_binary: &Path
         let fs = fatfs::FileSystem::new(&file, fatfs::FsOptions::new())?;
         {
             let root = fs.root_dir();
-            for (name, data) in [
+            let mut files = vec![
                 ("meta-data", meta_data(instance_id, hostname).into_bytes()),
                 ("user-data", user_data().into_bytes()),
                 ("cove-guest", binary),
-            ] {
+            ];
+            if let Some(n) = network {
+                files.push(("network-config", n.as_bytes().to_vec()));
+            }
+            for (name, data) in files {
                 let mut f = root.create_file(name)?;
                 f.truncate()?;
                 f.write_all(&data)?;
@@ -104,7 +116,7 @@ mod tests {
         let bin = dir.path().join("guest");
         std::fs::write(&bin, b"\x7fELF fake").unwrap();
         let img = dir.path().join("seed.img");
-        build(&img, "id-1", "box", &bin).unwrap();
+        build(&img, "id-1", "box", &bin, None).unwrap();
 
         let file = std::fs::File::open(&img).unwrap();
         let fs = fatfs::FileSystem::new(&file, fatfs::FsOptions::new()).unwrap();
@@ -131,5 +143,25 @@ mod tests {
             .read_to_end(&mut agent)
             .unwrap();
         assert_eq!(agent, b"\x7fELF fake");
+        assert!(fs.root_dir().open_file("network-config").is_err());
+    }
+
+    #[test]
+    fn seed_can_carry_a_network_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("guest");
+        std::fs::write(&bin, b"x").unwrap();
+        let img = dir.path().join("seed.img");
+        let config = crate::chv::NetSlot(0).network_config();
+        build(&img, "id-1", "box", &bin, Some(&config)).unwrap();
+        let file = std::fs::File::open(&img).unwrap();
+        let fs = fatfs::FileSystem::new(&file, fatfs::FsOptions::new()).unwrap();
+        let mut text = String::new();
+        fs.root_dir()
+            .open_file("network-config")
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, config);
     }
 }

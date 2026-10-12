@@ -97,13 +97,42 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
+/// What this server can do, so clients (Runo, scripts) can check before relying on
+/// something newer than the oldest server they talk to. Only ever add to this.
+pub const FEATURES: &[&str] = &[
+    "network",
+    "idle-stop",
+    "spawn",
+    "attach",
+    "forward",
+    "copy",
+    "files",
+    "stdin-eof",
+];
+
+/// Also lists `backend:<name>` for each backend that can run VMs here, and the one
+/// `auto` picks as `backend` (null when none can).
+pub fn health_value() -> serde_json::Value {
+    let mut features: Vec<String> = FEATURES.iter().map(|f| f.to_string()).collect();
+    for b in cove_core::backend::platform_backends() {
+        if cove_core::backend::check(b).is_ok() {
+            features.push(format!("backend:{b}"));
+        }
+    }
+    let auto = cove_core::backend::auto()
+        .ok()
+        .filter(|b| cove_core::backend::check(b).is_ok());
+    serde_json::json!({
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
         "protocol": cove_proto::PROTOCOL_VERSION,
-        "backend": cove_core::backend::platform_default(),
-    }))
+        "backend": auto,
+        "features": features,
+    })
+}
+
+async fn health() -> Json<serde_json::Value> {
+    Json(health_value())
 }
 
 async fn images(State(app): State<App>) -> Json<Vec<image::ImageInfo>> {
@@ -114,7 +143,9 @@ async fn pull_image(
     State(app): State<App>,
     Path(name): Path<String>,
 ) -> ApiResult<Vec<image::ImageInfo>> {
-    image::pull(&app.manager.paths, &name, &|_, _| {}).await?;
+    // Fetch the form the backend VMs get here boots from.
+    let backend = cove_core::backend::auto().unwrap_or(cove_core::backend::platform_default());
+    image::pull_for(&app.manager.paths, &name, backend).await?;
     Ok(Json(image::list(&app.manager.paths)))
 }
 
@@ -180,6 +211,8 @@ async fn exec(
     Json(command): Json<cove_proto::Command>,
 ) -> ApiResult<cove_core::guest::ExecOutput> {
     let guest = app.manager.guest(&name)?;
+    // A long command keeps the VM busy for idle stop, like an open stream.
+    let _open = app.manager.stream_opened(&name);
     Ok(Json(guest.exec(command).await?))
 }
 
@@ -299,7 +332,11 @@ async fn stream(
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
     let guest = app.manager.guest(&name)?;
-    Ok(ws.on_upgrade(move |socket| bridge(socket, guest)))
+    let open = app.manager.stream_opened(&name);
+    Ok(ws.on_upgrade(move |socket| async move {
+        bridge(socket, guest).await;
+        drop(open);
+    }))
 }
 
 async fn bridge(socket: WebSocket, guest: cove_core::guest::GuestAddr) {
@@ -400,10 +437,31 @@ pub async fn serve(manager: Arc<Manager>, listen: &str) -> Result<()> {
         "cove serving on {url} (data in {})",
         manager.paths.root.display()
     );
+    tokio::spawn(stop_idle_vms(manager.clone()));
     axum::serve(listener, router(manager, key))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+/// Check for idle VMs every `COVE_IDLE_CHECK_SECS` (30 by default).
+/// `COVE_IDLE_MINUTE_SECS` shortens a minute so tests don't wait for real ones.
+async fn stop_idle_vms(manager: Arc<Manager>) {
+    let secs = |var: &str, default: u64| {
+        std::env::var(var)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(default)
+    };
+    let every = std::time::Duration::from_secs(secs("COVE_IDLE_CHECK_SECS", 30));
+    let minute = std::time::Duration::from_secs(secs("COVE_IDLE_MINUTE_SECS", 60));
+    loop {
+        tokio::time::sleep(every).await;
+        for name in manager.stop_idle(minute).await {
+            eprintln!("stopped {name}: idle");
+        }
+    }
 }
 
 async fn shutdown_signal() {
@@ -413,5 +471,24 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = term.recv() => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn health_lists_features() {
+        let v = super::health_value();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        let features: Vec<&str> = v["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f.as_str().unwrap())
+            .collect();
+        for f in ["network", "idle-stop", "spawn", "attach", "forward", "copy"] {
+            assert!(features.contains(&f), "{f} missing");
+        }
     }
 }

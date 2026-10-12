@@ -2,7 +2,9 @@
 //! seeds, backends that boot VMs, and the client that talks to the guest agent.
 
 pub mod backend;
+pub mod chv;
 pub mod guest;
+pub mod gvisor;
 pub mod image;
 pub mod manager;
 pub mod model;
@@ -10,7 +12,7 @@ pub mod paths;
 pub mod seed;
 
 pub use manager::Manager;
-pub use model::{Mount, VmRecord, VmSpec, VmState, VmStatus};
+pub use model::{Mount, Network, VmRecord, VmSpec, VmState, VmStatus};
 
 /// Random lowercase hex, for ids and API keys.
 pub fn random_hex(bytes: usize) -> String {

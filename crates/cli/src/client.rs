@@ -21,19 +21,7 @@ impl Client {
     /// `COVE_API_KEY`, else the local `api-key` file.
     pub fn from_env(host: Option<String>) -> Result<Client> {
         let paths = Paths::from_env();
-        let url = host
-            .or_else(|| std::env::var("COVE_URL").ok())
-            .or_else(|| {
-                let text = std::fs::read_to_string(paths.server_file()).ok()?;
-                let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-                v["url"].as_str().map(String::from)
-            })
-            .unwrap_or_else(|| format!("http://{}", crate::DEFAULT_LISTEN));
-        let url = if url.contains("://") {
-            url
-        } else {
-            format!("http://{url}")
-        };
+        let url = server_url(host);
         let key = match std::env::var("COVE_API_KEY") {
             Ok(k) => k,
             Err(_) => std::fs::read_to_string(paths.api_key())
@@ -46,7 +34,7 @@ impl Client {
                 })?,
         };
         Ok(Client {
-            url: url.trim_end_matches('/').to_string(),
+            url,
             key,
             http: reqwest::Client::new(),
         })
@@ -153,6 +141,39 @@ impl Client {
             .await?;
         Ok(Stream { socket })
     }
+}
+
+/// The server to talk to: `--host`/`COVE_URL`, else the local server's
+/// `server.json`, else the default port.
+pub fn server_url(host: Option<String>) -> String {
+    let url = host
+        .or_else(|| std::env::var("COVE_URL").ok())
+        .or_else(|| {
+            let text = std::fs::read_to_string(Paths::from_env().server_file()).ok()?;
+            let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+            v["url"].as_str().map(String::from)
+        })
+        .unwrap_or_else(|| format!("http://{}", crate::DEFAULT_LISTEN));
+    let url = if url.contains("://") {
+        url
+    } else {
+        format!("http://{url}")
+    };
+    url.trim_end_matches('/').to_string()
+}
+
+/// `GET /v1/health`, which needs no API key.
+pub async fn health(url: &str) -> Result<serde_json::Value> {
+    let response = reqwest::Client::new()
+        .get(format!("{url}/v1/health"))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .with_context(|| format!("can't reach the cove server at {url}"))?;
+    if !response.status().is_success() {
+        bail!("the server at {url} answered {}", response.status());
+    }
+    Ok(response.json().await?)
 }
 
 pub struct Stream {
