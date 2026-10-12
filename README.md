@@ -233,7 +233,7 @@ flowchart LR
 | --- | --- | --- | --- | --- |
 | `vfkit` | Debian's generic cloud disk, EFI | vsock port 1024, through vfkit's Unix socket | virtio-fs | vfkit's NAT |
 | `cloud-hypervisor` | The same disk with cloud-hypervisor's EDK2 firmware (downloaded on first use) | Hybrid vsock: a Unix socket and `CONNECT 1024` | One `virtiofsd` per folder | A tap device per VM, a static /30 through cloud-init, iptables NAT |
-| `gvisor` | Debian's official `debian:trixie` image, fetched from Docker Hub with every digest checked | A Unix socket the agent opens inside the sandbox, which gVisor exposes to the host | Bind mounts | A network namespace and veth pair per VM, the same /30s and NAT, and gVisor's own network stack |
+| `gvisor` | Debian's official `debian:trixie` image, fetched from Docker Hub (or Google's mirror of it, `mirror.gcr.io`, when Docker Hub refuses) with every digest checked | A Unix socket the agent opens inside the sandbox, which gVisor exposes to the host | Bind mounts | A network namespace and veth pair per VM, the same /30s and NAT, and gVisor's own network stack |
 
 | Crate | Role |
 | --- | --- |
