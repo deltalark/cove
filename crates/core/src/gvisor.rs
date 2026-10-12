@@ -609,6 +609,8 @@ mod tests {
         );
     }
 
+    // gVisor is Linux only, and this uses GNU cp.
+    #[cfg(target_os = "linux")]
     #[test]
     fn trees_copy_with_their_modes() {
         use std::os::unix::fs::PermissionsExt;

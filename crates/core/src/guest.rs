@@ -165,7 +165,8 @@ mod lossy {
     }
 }
 
-#[cfg(test)]
+// The /proc/self/fd trick is Linux's; other systems never take that path.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
