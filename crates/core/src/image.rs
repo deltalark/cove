@@ -38,6 +38,10 @@ pub const CATALOG: &[Catalog] = &[Catalog {
 
 const REGISTRY: &str = "https://registry-1.docker.io";
 const REGISTRY_AUTH: &str = "https://auth.docker.io/token?service=registry.docker.io";
+/// Google's mirror of Docker Hub's official images, used when Docker Hub refuses
+/// (it limits anonymous pulls per IP, and VPS addresses are often shared).
+/// Layers are checked against their digests either way.
+const MIRROR: &str = "https://mirror.gcr.io";
 
 /// Debian's name for the host's architecture (guests match the host).
 pub fn debian_arch() -> &'static str {
@@ -259,46 +263,21 @@ pub async fn pull_rootfs(paths: &Paths, name: &str) -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("unknown image {name:?}"))?;
     let repo = entry.oci_repo;
     let client = reqwest::Client::new();
-    let token: serde_json::Value = client
-        .get(format!("{REGISTRY_AUTH}&scope=repository:{repo}:pull"))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    let token = token["token"].as_str().unwrap_or_default().to_string();
+    let (registry, token, layers) =
+        match oci_layers(&client, REGISTRY, true, repo, entry.oci_tag).await {
+            Ok(found) => found,
+            Err(hub) => oci_layers(&client, MIRROR, false, repo, entry.oci_tag)
+                .await
+                .map_err(|_| hub.context("pulling from Docker Hub"))?,
+        };
     let get = |url: String, accept: &'static str| {
-        client
-            .get(url)
-            .bearer_auth(&token)
-            .header("Accept", accept)
-            .send()
+        let req = client.get(url).header("Accept", accept);
+        match &token {
+            Some(t) => req.bearer_auth(t),
+            None => req,
+        }
+        .send()
     };
-    let index: serde_json::Value = get(
-        format!("{REGISTRY}/v2/{repo}/manifests/{}", entry.oci_tag),
-        "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json",
-    )
-    .await?
-    .error_for_status()?
-    .json()
-    .await?;
-    let (arch, variant) = oci_arch();
-    let digest = pick_manifest(&index, arch, variant)
-        .ok_or_else(|| anyhow!("{repo}:{} has no linux/{arch} image", entry.oci_tag))?;
-    let manifest: serde_json::Value = get(
-        format!("{REGISTRY}/v2/{repo}/manifests/{digest}"),
-        "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json",
-    )
-    .await?
-    .error_for_status()?
-    .json()
-    .await?;
-    let layers: Vec<String> = manifest["layers"]
-        .as_array()
-        .ok_or_else(|| anyhow!("the image manifest lists no layers"))?
-        .iter()
-        .filter_map(|l| l["digest"].as_str().map(String::from))
-        .collect();
 
     let dir = paths.image_dir(name);
     std::fs::create_dir_all(&dir)?;
@@ -313,7 +292,7 @@ pub async fn pull_rootfs(paths: &Paths, name: &str) -> Result<PathBuf> {
             .ok_or_else(|| anyhow!("unsupported digest {layer}"))?
             .to_string();
         let data = get(
-            format!("{REGISTRY}/v2/{repo}/blobs/{layer}"),
+            format!("{registry}/v2/{repo}/blobs/{layer}"),
             "application/octet-stream",
         )
         .await?
@@ -336,6 +315,63 @@ pub async fn pull_rootfs(paths: &Paths, name: &str) -> Result<PathBuf> {
     }
     std::fs::rename(&partial, &rootfs)?;
     Ok(rootfs)
+}
+
+/// The layer digests of `repo:tag` for this platform on `registry`, with the token
+/// that reads them (Docker Hub needs one; the mirror doesn't).
+async fn oci_layers(
+    client: &reqwest::Client,
+    registry: &str,
+    auth: bool,
+    repo: &str,
+    tag: &str,
+) -> Result<(String, Option<String>, Vec<String>)> {
+    let token = if auth {
+        let t: serde_json::Value = client
+            .get(format!("{REGISTRY_AUTH}&scope=repository:{repo}:pull"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Some(t["token"].as_str().unwrap_or_default().to_string())
+    } else {
+        None
+    };
+    let get = |url: String, accept: &'static str| {
+        let req = client.get(url).header("Accept", accept);
+        match &token {
+            Some(t) => req.bearer_auth(t),
+            None => req,
+        }
+        .send()
+    };
+    let index: serde_json::Value = get(
+        format!("{registry}/v2/{repo}/manifests/{tag}"),
+        "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json",
+    )
+    .await?
+    .error_for_status()?
+    .json()
+    .await?;
+    let (arch, variant) = oci_arch();
+    let digest = pick_manifest(&index, arch, variant)
+        .ok_or_else(|| anyhow!("{repo}:{tag} has no linux/{arch} image"))?;
+    let manifest: serde_json::Value = get(
+        format!("{registry}/v2/{repo}/manifests/{digest}"),
+        "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json",
+    )
+    .await?
+    .error_for_status()?
+    .json()
+    .await?;
+    let layers = manifest["layers"]
+        .as_array()
+        .ok_or_else(|| anyhow!("the image manifest lists no layers"))?
+        .iter()
+        .filter_map(|l| l["digest"].as_str().map(String::from))
+        .collect();
+    Ok((registry.to_string(), token, layers))
 }
 
 /// Unpack one gzipped layer over `root`, applying OCI whiteouts (`.wh.<name>` deletes
