@@ -137,12 +137,13 @@ fn handle(conn: Box<dyn Stream>) {
         Request::Ping => {
             send(&writer, &Frame::ok(system::ping()));
         }
-        Request::Exec(command) => match procs::Proc::start("", &command) {
+        Request::Exec(command) => match procs::Proc::exec(&command) {
             Ok(proc) => {
                 let open = forward_input(reader, proc.clone());
                 proc.follow(0, &|| open.load(Ordering::Relaxed), &mut |f| {
                     send(&writer, &f)
                 });
+                proc.release();
                 if proc.running() {
                     // The client left before the command finished.
                     proc.signal(libc::SIGKILL);
