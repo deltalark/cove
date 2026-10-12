@@ -253,7 +253,7 @@ pub fn setup_nat() -> Result<()> {
 /// guest agent doesn't answer.
 pub async fn power_button(vm_dir: &Path) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut s = tokio::net::UnixStream::connect(vm_dir.join("api.sock")).await?;
+    let mut s = crate::guest::connect_unix(&vm_dir.join("api.sock")).await?;
     s.write_all(
         b"PUT /api/v1/vm.power-button HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
     )

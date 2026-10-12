@@ -2,7 +2,8 @@
 # Boot a real VM and check the basics, with `cove serve` already running.
 #
 # - Mac: vfkit, after `scripts/build-guest.sh` (or an install from a release).
-# - Linux: cloud-hypervisor on a machine with /dev/kvm. The server must run as root
+# - Linux: cloud-hypervisor on a machine with /dev/kvm, or gVisor without it (the
+#   backend `auto` picks; set COVE_BACKEND to choose). The server must run as root
 #   (the systemd service from scripts/install.sh does) so VMs get a network; run
 #   this as root too, or with COVE_API_KEY set to the server's key.
 set -eu
@@ -24,22 +25,34 @@ echo "== host: $(uname -sm)"
 "$R" doctor || true
 "$R" image ls | grep -q "debian-13.*pulled," || "$R" image pull debian-13
 echo "== boot"
-time "$R" up "$name" --cpus 2 --memory 2048 --mount "$work:/work"
+started=$(date +%s)
+"$R" up "$name" --backend "${COVE_BACKEND:-auto}" --cpus 2 --memory 2048 --mount "$work:/work"
+echo "booted in $(($(date +%s) - started))s"
+"$R" show "$name" | grep '"backend"'
 echo "== exec"
 "$R" exec "$name" -- uname -a
 "$R" exec "$name" -- cat /work/host.txt
 echo "== guest writes reach the host"
 "$R" exec "$name" -- sh -c 'echo from-guest > /work/guest.txt'
 grep -q from-guest "$work/guest.txt"
-echo "== network"
-"$R" exec "$name" -- sh -c 'getent hosts deb.debian.org'
-"$R" exec "$name" -- sh -c 'apt-get -qq update >/dev/null && echo apt reaches the mirror'
+# COVE_SMOKE_OFFLINE=1 skips this on a host that has no internet itself.
+if [ "${COVE_SMOKE_OFFLINE:-0}" != 1 ]; then
+  echo "== network"
+  "$R" exec "$name" -- sh -c 'getent hosts deb.debian.org'
+  "$R" exec "$name" -- sh -c 'apt-get -qq update >/dev/null && echo apt reaches the mirror'
+fi
 echo "== stdin and binary data"
 head -c 300000 /dev/urandom > "$work/blob"
 cp "$work/blob" "$work/blob.sent"
 "$R" exec "$name" -- cat < "$work/blob.sent" | cmp - "$work/blob"
 echo "== ports"
-"$R" spawn "$name" web -- python3 -m http.server 8000 --directory /work
+# Perl is in every Debian image, including gVisor's minimal rootfs.
+cat > "$work/serve.pl" <<'EOF'
+use IO::Socket::INET;
+my $s = IO::Socket::INET->new(LocalAddr => '0.0.0.0:8000', Listen => 5, ReuseAddr => 1) or die;
+while (my $c = $s->accept) { <$c>; open my $f, '<', '/work/host.txt'; print $c "HTTP/1.0 200 OK\r\n\r\n", <$f>; close $c }
+EOF
+"$R" spawn "$name" web -- perl /work/serve.pl
 sleep 2
 url="$("$R" forward "$name" 8000)"
 curl -fsS "$url/host.txt"
@@ -55,10 +68,10 @@ echo "== copy"
 "$R" exec "$copy" -- cat /root/marker
 "$R" rm "$copy"
 echo "== network off"
-"$R" up "$offline" --cpus 1 --memory 1024 --network off
+"$R" up "$offline" --backend "${COVE_BACKEND:-auto}" --cpus 1 --memory 1024 --network off
 if "$R" exec "$offline" -- sh -c 'getent hosts deb.debian.org' >/dev/null 2>&1; then
   echo "a VM with --network off reached DNS" >&2
   exit 1
 fi
-"$R" exec "$offline" -- sh -c 'ip -o link | grep -v " lo:" || echo "no network devices"'
+"$R" exec "$offline" -- cat /proc/net/dev
 echo "OK"

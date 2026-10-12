@@ -331,6 +331,13 @@ pub fn launch(record: &VmRecord, vm_dir: &Path, opts: &LaunchOptions) -> Result<
                 .firmware
                 .clone()
                 .context("no cloud-hypervisor firmware (see cove doctor)")?;
+            // cloud-hypervisor binds these itself, within the ~100-byte socket limit.
+            if vm_dir.join("vsock.sock").as_os_str().len() > 100 {
+                bail!(
+                    "{} is too deep for cloud-hypervisor's sockets; use a shorter COVE_HOME",
+                    vm_dir.display()
+                );
+            }
             for stale in ["vsock.sock", "api.sock"] {
                 let _ = std::fs::remove_file(vm_dir.join(stale));
             }
