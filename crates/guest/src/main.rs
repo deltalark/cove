@@ -46,7 +46,7 @@ impl Stream for vsock::VsockStream {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: cove-guest [--listen vsock:PORT | tcp:HOST:PORT | unix:PATH]\n\
+        "usage: cove-guest [--init] [--listen vsock:PORT | tcp:HOST:PORT | unix:PATH]\n\
          default: vsock:{}",
         cove_proto::GUEST_PORT
     );
@@ -55,10 +55,13 @@ fn usage() -> ! {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let mut listen = format!("vsock:{}", cove_proto::GUEST_PORT);
+    let mut listen = std::env::var("COVE_GUEST_LISTEN")
+        .unwrap_or_else(|_| format!("vsock:{}", cove_proto::GUEST_PORT));
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--listen" => listen = args.next().unwrap_or_else(|| usage()),
+            // Must come before anything starts a thread.
+            "--init" => run_as_init(),
             "--version" => {
                 println!("cove-guest {}", env!("CARGO_PKG_VERSION"));
                 return;
@@ -73,6 +76,55 @@ fn main() {
     if let Err(e) = serve(&listen) {
         eprintln!("cove-guest: {e}");
         std::process::exit(1);
+    }
+}
+
+static AGENT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+extern "C" fn forward_signal(signal: libc::c_int) {
+    let pid = AGENT.load(Ordering::Relaxed);
+    if pid > 0 {
+        unsafe {
+            libc::kill(pid, signal);
+        }
+    }
+}
+
+/// For a sandbox (gVisor), where the agent is the first process: an init has to reap
+/// orphaned processes, but reaping in the agent itself would steal the exit codes it
+/// waits for. So fork: the child carries on as the agent, and this process only
+/// reaps, passes on SIGTERM and SIGINT, and exits with the agent's status.
+fn run_as_init() {
+    let pid = unsafe { libc::fork() };
+    if pid <= 0 {
+        // The child, or fork failed and we run as the agent anyway.
+        return;
+    }
+    AGENT.store(pid, Ordering::Relaxed);
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            forward_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            forward_signal as *const () as libc::sighandler_t,
+        );
+    }
+    loop {
+        let mut status = 0;
+        let reaped = unsafe { libc::waitpid(-1, &mut status, 0) };
+        if reaped == pid {
+            let code = if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else {
+                128 + libc::WTERMSIG(status)
+            };
+            std::process::exit(code);
+        }
+        if reaped < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            std::process::exit(1);
+        }
     }
 }
 
