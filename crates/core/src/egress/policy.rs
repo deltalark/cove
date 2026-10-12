@@ -230,11 +230,36 @@ pub fn private(ip: IpAddr) -> bool {
     }
 }
 
-/// Make the placeholder a VM sees for a secret. It keeps the value's short public
-/// prefix (`sk-ant-api03-`, `ghp_`), since some CLIs check it before sending.
+/// Prefixes that only name a key's type, most specific first.
+const PUBLIC_PREFIXES: &[&str] = &[
+    "sk-ant-api03-",
+    "sk-ant-oat01-",
+    "sk-ant-",
+    "sk-or-v1-",
+    "sk-proj-",
+    "sk-svcacct-",
+    "sk-",
+    "github_pat_",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "glpat-",
+    "xoxb-",
+    "xoxp-",
+    "AIza",
+];
+
+/// Make the placeholder a VM sees for a secret. It keeps a known public prefix
+/// (`sk-ant-api03-`, `ghp_`), since some CLIs check it before sending; nothing else
+/// from the value, which could be part of the secret itself.
 pub fn make_placeholder(value: &str) -> String {
-    let head: String = value.chars().take(16).collect();
-    let prefix = head.rfind(['-', '_']).map(|i| &head[..=i]).unwrap_or("");
+    let prefix = PUBLIC_PREFIXES
+        .iter()
+        .find(|p| value.starts_with(**p))
+        .copied()
+        .unwrap_or("");
     format!("{prefix}cove{}", crate::random_hex(16))
 }
 
@@ -355,6 +380,8 @@ mod tests {
         assert!(!p.contains("secret"));
         assert!(make_placeholder("ghp_abcdef").starts_with("ghp_cove"));
         assert!(make_placeholder("plain").starts_with("cove"));
+        assert!(make_placeholder("supersecret-value").starts_with("cove"));
+        assert!(make_placeholder("3f2a9c1d-8b7e-4c3a-9d2e-1a2b3c4d5e6f").starts_with("cove"));
         assert!(valid_secret_name("GH_TOKEN"));
         assert!(!valid_secret_name("gh-token"));
         assert!(!valid_secret_name("1X"));
