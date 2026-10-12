@@ -1,6 +1,7 @@
 //! The set of VMs on this machine and their lifecycle.
 
 use crate::backend::{self, Launch};
+use crate::egress::{policy, policy::Policy, tls::Tls, Egress};
 use crate::guest::GuestAddr;
 use crate::model::{Forward, Network, VmRecord, VmSpec, VmState, VmStatus};
 use crate::paths::Paths;
@@ -23,6 +24,97 @@ struct Live {
     state: Option<VmState>,
     error: Option<String>,
     forwards: Vec<(Forward, tokio::task::JoinHandle<()>)>,
+    /// The VM's egress proxy and the tasks keeping streams open for it.
+    egress: Option<(Arc<Egress>, Vec<tokio::task::JoinHandle<()>>)>,
+}
+
+/// How many egress streams wait in the guest at once: the most connections programs
+/// in the VM can open at the same instant before one waits for the next stream.
+const EGRESS_STREAMS: usize = 8;
+
+/// Where the CA certificate goes in a VM, and what installs it.
+const GUEST_CA: &str = "/etc/cove/egress-ca.pem";
+const INSTALL_CA: &str = r#"set -e
+mkdir -p /usr/local/share/ca-certificates
+cp /etc/cove/egress-ca.pem /usr/local/share/ca-certificates/cove-egress.crt
+if command -v update-ca-certificates >/dev/null 2>&1; then
+  update-ca-certificates >/dev/null 2>&1 || true
+fi
+bundle=/etc/ssl/certs/ca-certificates.crt
+if [ -f "$bundle" ] && ! grep -qF "$(sed -n 2p /etc/cove/egress-ca.pem)" "$bundle"; then
+  cat /etc/cove/egress-ca.pem >> "$bundle"
+fi
+if [ -f "$bundle" ]; then echo bundle; fi
+"#;
+
+/// The guest port programs use for the proxy. `COVE_EGRESS_GUEST_PORT` changes it,
+/// for tests on the host backend, where "the guest" shares this machine's ports.
+fn egress_guest_port() -> u16 {
+    std::env::var("COVE_EGRESS_GUEST_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(cove_proto::EGRESS_PORT)
+}
+
+/// The proxy's rules for a VM.
+fn policy_for(spec: &VmSpec) -> Policy {
+    Policy::new(
+        &spec.allow,
+        &spec.secrets,
+        spec.network == Network::Allowlist,
+    )
+}
+
+/// Check and tidy a new VM's allowlist and secrets, and make the placeholders.
+pub fn prepare_egress(spec: &mut VmSpec) -> Result<()> {
+    let mut allow = Vec::new();
+    for rule in &spec.allow {
+        let rule = policy::normalize_rule(rule).map_err(anyhow::Error::msg)?;
+        if !allow.contains(&rule) {
+            allow.push(rule);
+        }
+    }
+    spec.allow = allow;
+    let mut seen = std::collections::HashSet::new();
+    for secret in &mut spec.secrets {
+        if !policy::valid_secret_name(&secret.name) {
+            bail!(
+                "secret names are environment variable names (A-Z, 0-9, _): {:?}",
+                secret.name
+            );
+        }
+        if !seen.insert(secret.name.clone()) {
+            bail!("secret {} is given twice", secret.name);
+        }
+        if secret.value.is_empty() {
+            bail!("secret {} has no value", secret.name);
+        }
+        if secret.hosts.is_empty() {
+            secret.hosts = policy::default_hosts(&secret.name)
+                .iter()
+                .map(|h| h.to_string())
+                .collect();
+        }
+        if secret.hosts.is_empty() {
+            bail!(
+                "say where secret {} may be sent (its hosts); Cove only knows the usual hosts for well-known names",
+                secret.name
+            );
+        }
+        let mut hosts = Vec::new();
+        for h in &secret.hosts {
+            let h = policy::normalize_rule(h).map_err(anyhow::Error::msg)?;
+            if h == "*" || h.starts_with('@') {
+                bail!("secret {} needs real host names, not {h:?}", secret.name);
+            }
+            hosts.push(h);
+        }
+        secret.hosts = hosts;
+        if secret.placeholder.is_empty() {
+            secret.placeholder = policy::make_placeholder(&secret.value);
+        }
+    }
+    Ok(())
 }
 
 /// How recently a VM was used, for idle stop.
@@ -55,6 +147,8 @@ pub struct Manager {
     net_lock: Mutex<()>,
     /// Host name used in forwarded-port URLs.
     pub url_host: String,
+    /// The egress proxy's certificate authority, loaded on first use.
+    tls: std::sync::OnceLock<Arc<Tls>>,
 }
 
 impl Manager {
@@ -67,6 +161,7 @@ impl Manager {
             locks: Mutex::new(HashMap::new()),
             net_lock: Mutex::new(()),
             url_host: "127.0.0.1".into(),
+            tls: std::sync::OnceLock::new(),
         }))
     }
 
@@ -139,6 +234,16 @@ impl Manager {
             tags: record.spec.tags.clone(),
             network: record.spec.network,
             idle_stop_minutes: record.spec.idle_stop_minutes,
+            allow: record.spec.allow.clone(),
+            secrets: record
+                .spec
+                .secrets
+                .iter()
+                .map(|s| crate::model::SecretInfo {
+                    name: s.name.clone(),
+                    hosts: s.hosts.clone(),
+                })
+                .collect(),
             created_at: record.created_at,
             error: entry.and_then(|l| l.error.clone()),
             forwards: entry
@@ -261,6 +366,8 @@ impl Manager {
         if spec.idle_stop_minutes == Some(0) {
             bail!("idle stop takes at least 1 minute");
         }
+        let mut spec = spec;
+        prepare_egress(&mut spec)?;
         let backend = backend::resolve(&spec.backend)?;
         backend::check(backend).map_err(|e| anyhow!(e))?;
         if backend == backend::HOST
@@ -311,7 +418,6 @@ impl Manager {
         } else {
             std::fs::create_dir_all(&dir)?;
         }
-        let mut spec = spec;
         spec.backend = backend.to_string();
         let record = VmRecord {
             created_at: crate::now(),
@@ -337,7 +443,10 @@ impl Manager {
             return self.status(name).await;
         }
         self.set_state(name, Some(VmState::Starting), None).await;
-        let result = self.boot(&record, &dir).await;
+        let mut result = self.boot(&record, &dir).await;
+        if result.is_ok() {
+            result = self.start_egress(name).await;
+        }
         match &result {
             Ok(()) => {
                 self.touch(name);
@@ -428,7 +537,193 @@ impl Manager {
                     .with_context(|| format!("mounting {} at {}", m.host, m.guest))?;
             }
         }
+        if record.spec.egress() {
+            self.prepare_guest_egress(record, &launch.guest)
+                .await
+                .context("setting up the egress proxy")?;
+        }
         Ok(())
+    }
+
+    fn tls(&self) -> Result<Arc<Tls>> {
+        if let Some(t) = self.tls.get() {
+            return Ok(t.clone());
+        }
+        let tls = Arc::new(Tls::load_or_create(&self.paths.root.join("egress"))?);
+        Ok(self.tls.get_or_init(|| tls).clone())
+    }
+
+    /// Install the proxy's authority in the guest and give every command the proxy
+    /// and the secrets' placeholders.
+    async fn prepare_guest_egress(&self, record: &VmRecord, guest: &GuestAddr) -> Result<()> {
+        let tls = self.tls()?;
+        let proxy = format!("http://127.0.0.1:{}", egress_guest_port());
+        let mut env: Vec<(String, String)> = Vec::new();
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+            env.push((key.into(), proxy.clone()));
+        }
+        for key in ["NO_PROXY", "no_proxy"] {
+            env.push((key.into(), "localhost,127.0.0.1,::1".into()));
+        }
+        // Node's own fetch only uses the proxy variables when asked to.
+        env.push(("NODE_USE_ENV_PROXY".into(), "1".into()));
+        let ca_path = if record.spec.backend == backend::HOST {
+            // The dev backend's "guest" is this machine: leave its trust store alone.
+            self.paths
+                .root
+                .join("egress")
+                .join("ca.pem")
+                .display()
+                .to_string()
+        } else {
+            guest
+                .call(&Request::WriteFile {
+                    path: GUEST_CA.into(),
+                    data: tls.ca_pem.as_bytes().to_vec().into(),
+                    mode: Some(0o644),
+                })
+                .await?;
+            let out = guest
+                .exec(cove_proto::Command {
+                    cmd: vec!["sh".into(), "-c".into(), INSTALL_CA.into()],
+                    ..Default::default()
+                })
+                .await?;
+            if out.code != Some(0) {
+                bail!(
+                    "installing the certificate failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            if String::from_utf8_lossy(&out.stdout).contains("bundle") {
+                for key in ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"] {
+                    env.push((key.into(), "/etc/ssl/certs/ca-certificates.crt".into()));
+                }
+            }
+            GUEST_CA.to_string()
+        };
+        env.push(("NODE_EXTRA_CA_CERTS".into(), ca_path));
+        for secret in &record.spec.secrets {
+            env.push((secret.name.clone(), secret.placeholder.clone()));
+        }
+        if record.spec.backend != backend::HOST {
+            // Login shells (an SSH session, a terminal) get the same.
+            let profile: String = env
+                .iter()
+                .map(|(k, v)| format!("export {k}='{}'\n", v.replace('\'', "'\\''")))
+                .collect();
+            guest
+                .call(&Request::WriteFile {
+                    path: "/etc/profile.d/cove-egress.sh".into(),
+                    data: profile.into_bytes().into(),
+                    mode: Some(0o644),
+                })
+                .await?;
+        }
+        guest.call(&Request::SetEnv { env }).await?;
+        Ok(())
+    }
+
+    /// Start the egress proxy for a running VM that uses one, if it isn't running.
+    async fn start_egress(self: &Arc<Self>, name: &str) -> Result<()> {
+        let record = self.record(name)?;
+        if !record.spec.egress() {
+            return Ok(());
+        }
+        let guest = self.running_guest(name)?;
+        let mut live = self.live.lock().await;
+        let entry = live.entry(name.to_string()).or_default();
+        if entry.egress.is_some() {
+            return Ok(());
+        }
+        let egress = Arc::new(Egress::new(policy_for(&record.spec), self.tls()?));
+        let port = egress_guest_port();
+        let tasks = (0..EGRESS_STREAMS)
+            .map(|_| {
+                tokio::spawn(egress_worker(
+                    Arc::downgrade(self),
+                    name.to_string(),
+                    guest.clone(),
+                    port,
+                    egress.clone(),
+                ))
+            })
+            .collect();
+        entry.egress = Some((egress, tasks));
+        Ok(())
+    }
+
+    async fn stop_egress(&self, name: &str) {
+        if let Some(entry) = self.live.lock().await.get_mut(name) {
+            if let Some((_, tasks)) = entry.egress.take() {
+                for t in tasks {
+                    t.abort();
+                }
+            }
+        }
+    }
+
+    /// Start the proxies of VMs that kept running while the server was down.
+    pub async fn resume(self: &Arc<Self>) {
+        for name in self.names() {
+            if self.running_guest(&name).is_ok() {
+                if let Err(e) = self.start_egress(&name).await {
+                    eprintln!("{name}: could not start its egress proxy: {e:#}");
+                }
+            }
+        }
+    }
+
+    /// A VM's egress rules, secrets (names and hosts only) and recent decisions.
+    pub async fn egress(&self, name: &str) -> Result<EgressReport> {
+        let record = self.record(name)?;
+        let log = self
+            .live
+            .lock()
+            .await
+            .get(name)
+            .and_then(|l| l.egress.as_ref())
+            .map(|(e, _)| e.log())
+            .unwrap_or_default();
+        Ok(EgressReport {
+            network: record.spec.network,
+            enforced: record.spec.network == Network::Allowlist,
+            allow: record.spec.allow.clone(),
+            secrets: record
+                .spec
+                .secrets
+                .iter()
+                .map(|s| crate::model::SecretInfo {
+                    name: s.name.clone(),
+                    hosts: s.hosts.clone(),
+                })
+                .collect(),
+            log,
+        })
+    }
+
+    /// Replace a VM's allowlist. A running VM's proxy uses it for new connections
+    /// straight away.
+    pub async fn set_allow(&self, name: &str, allow: Vec<String>) -> Result<EgressReport> {
+        let lock = self.lock(name).await;
+        let _guard = lock.lock().await;
+        let mut record = self.record(name)?;
+        let mut spec = record.spec.clone();
+        spec.allow = allow;
+        prepare_egress(&mut spec)?;
+        record.spec.allow = spec.allow;
+        self.save_record(&record)?;
+        if let Some((egress, _)) = self
+            .live
+            .lock()
+            .await
+            .get(name)
+            .and_then(|l| l.egress.as_ref())
+        {
+            egress.set_policy(policy_for(&record.spec));
+        }
+        drop(_guard);
+        self.egress(name).await
     }
 
     pub async fn stop(self: &Arc<Self>, name: &str) -> Result<VmStatus> {
@@ -437,6 +732,7 @@ impl Manager {
         let record = self.record(name)?;
         let dir = self.paths.vm_dir(name);
         self.close_forwards(name).await;
+        self.stop_egress(name).await;
         if let Some(launch) = Launch::load(&dir) {
             if launch.alive() {
                 self.set_state(name, Some(VmState::Stopping), None).await;
@@ -624,7 +920,61 @@ impl Drop for StreamGuard {
 
 /// Open a raw TCP pipe to a guest port.
 pub async fn open_tcp(guest: &GuestAddr, port: u16) -> Result<crate::guest::GuestStream> {
-    let mut s = guest.open(&Request::Tcp { port }).await?;
+    open_pipe(guest, &Request::Tcp { port }).await
+}
+
+/// Keep one egress stream waiting in the guest; hand each connection that arrives
+/// to the proxy and open the next. Ends when the VM stops.
+async fn egress_worker(
+    manager: Weak<Manager>,
+    name: String,
+    guest: GuestAddr,
+    port: u16,
+    egress: Arc<Egress>,
+) {
+    let mut failures: u32 = 0;
+    loop {
+        match open_pipe(&guest, &Request::EgressAccept { port }).await {
+            Ok(stream) => {
+                failures = 0;
+                // A program reaching the internet is using the VM.
+                if let Some(m) = manager.upgrade() {
+                    m.touch(&name);
+                }
+                tokio::spawn(egress.clone().handle(stream));
+            }
+            Err(e) => {
+                let Some(m) = manager.upgrade() else {
+                    return;
+                };
+                if m.running_guest(&name).is_err() {
+                    return;
+                }
+                failures += 1;
+                if failures == 5 {
+                    eprintln!("{name}: egress stream keeps failing: {e:#}");
+                }
+                tokio::time::sleep(Duration::from_millis(200 * failures.min(25) as u64)).await;
+            }
+        }
+    }
+}
+
+/// What `GET /v1/vms/{name}/egress` returns.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EgressReport {
+    pub network: Network,
+    /// Whether the allowlist is enforced (network `allowlist`). Otherwise the proxy
+    /// only adds secrets, and the VM can reach anything through its own device.
+    pub enforced: bool,
+    pub allow: Vec<String>,
+    pub secrets: Vec<crate::model::SecretInfo>,
+    pub log: Vec<crate::egress::LogEntry>,
+}
+
+/// Send a request whose `Ok` reply turns the stream into a raw pipe.
+async fn open_pipe(guest: &GuestAddr, request: &Request) -> Result<crate::guest::GuestStream> {
+    let mut s = guest.open(request).await?;
     // Read the reply line byte by byte so no piped data is swallowed.
     let mut reply = Vec::new();
     let mut byte = [0u8; 1];

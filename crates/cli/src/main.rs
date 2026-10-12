@@ -8,7 +8,8 @@ mod term;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use client::Client;
-use cove_core::model::{Mount, VmSpec};
+use cove_core::manager::EgressReport;
+use cove_core::model::{Mount, Secret, VmSpec};
 use cove_core::paths::Paths;
 use cove_core::{backend, image, Manager, Network, VmStatus};
 use cove_proto::{Command as GuestCommand, Request};
@@ -71,9 +72,12 @@ enum Cmd {
         /// (development only).
         #[arg(long, default_value = "auto")]
         backend: String,
-        /// full (NAT to the internet) or off (no network device at all).
+        /// full (NAT to the internet), off (no network device at all) or allowlist
+        /// (only the hosts given with --allow, through Cove's proxy).
         #[arg(long, default_value = "full")]
         network: Network,
+        #[command(flatten)]
+        egress: EgressArgs,
         /// Stop the VM after this many minutes with no commands, streams or running
         /// named processes.
         #[arg(long = "idle-stop", value_name = "MINUTES")]
@@ -182,6 +186,17 @@ enum Cmd {
         name: String,
         port: u16,
     },
+    /// Show what a VM may reach, its secrets (names only) and what it tried to reach.
+    Egress {
+        name: String,
+    },
+    /// Replace a VM's allowlist; a running VM uses it straight away.
+    Allow {
+        name: String,
+        /// host, *.domain, * or a preset (@dev, @agents). None allows only the
+        /// secrets' hosts.
+        rules: Vec<String>,
+    },
     /// Run the MCP server (stdio) for agents.
     Mcp,
     /// Print the client's and the server's version and the server's features.
@@ -204,12 +219,74 @@ struct Ensure {
     /// With --create: auto, vfkit, cloud-hypervisor, gvisor or host (development only).
     #[arg(long, env = "COVE_BACKEND", default_value = "auto")]
     backend: String,
-    /// With --create: full or off.
+    /// With --create: full, off or allowlist.
     #[arg(long, default_value = "full")]
     network: Network,
+    #[command(flatten)]
+    egress: EgressArgs,
     /// With --create: stop the VM after this many idle minutes.
     #[arg(long = "idle-stop", value_name = "MINUTES")]
     idle_stop: Option<u64>,
+}
+
+/// Where a new VM may connect, and the secrets Cove adds for it.
+#[derive(clap::Args)]
+struct EgressArgs {
+    /// A host the VM may reach with --network allowlist: example.com, *.example.com,
+    /// `*`, or a preset: @dev (git hosts, package registries and model APIs) or
+    /// @agents (model APIs only). Repeat for more. Default with allowlist: @dev.
+    #[arg(long = "allow", value_name = "RULE")]
+    allow: Vec<String>,
+    /// NAME or NAME@HOST,HOST: take NAME from your environment and keep it out of the
+    /// VM. The VM sees a placeholder, which Cove's proxy swaps for the real value in
+    /// HTTPS requests to those hosts (well-known names like ANTHROPIC_API_KEY,
+    /// OPENAI_API_KEY and GH_TOKEN know theirs).
+    #[arg(long = "secret", value_name = "NAME[@HOSTS]")]
+    secrets: Vec<String>,
+}
+
+impl EgressArgs {
+    /// `allow` and `secrets` for a create request.
+    fn body(&self, network: Network) -> Result<(Vec<String>, Vec<Secret>)> {
+        let mut allow = self.allow.clone();
+        if network == Network::Allowlist && allow.is_empty() {
+            allow.push("@dev".into());
+        }
+        let secrets = self
+            .secrets
+            .iter()
+            .map(|s| parse_secret(s))
+            .collect::<Result<Vec<_>>>()?;
+        Ok((allow, secrets))
+    }
+}
+
+fn parse_secret(text: &str) -> Result<Secret> {
+    let (name, hosts) = match text.split_once('@') {
+        Some((n, h)) => (
+            n,
+            h.split(',')
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty())
+                .collect(),
+        ),
+        None => (text, Vec::new()),
+    };
+    if name.contains('=') {
+        bail!(
+            "--secret takes a variable name, not a value: export {} and pass --secret {}",
+            name.split('=').next().unwrap_or(name),
+            name.split('=').next().unwrap_or(name)
+        );
+    }
+    let value = std::env::var(name)
+        .map_err(|_| anyhow::anyhow!("--secret {name}: {name} is not set in your environment"))?;
+    Ok(Secret {
+        name: name.to_string(),
+        value,
+        hosts,
+        placeholder: String::new(),
+    })
 }
 
 /// Make sure `name` is running: start it if stopped, create it with `--create`.
@@ -230,6 +307,7 @@ async fn ensure_running(client: &Client, name: &str, ensure: &Ensure) -> Result<
                 .iter()
                 .map(|m| parse_mount(m))
                 .collect::<Result<Vec<_>>>()?;
+            let (allow, secrets) = ensure.egress.body(ensure.network)?;
             let body = serde_json::json!({
                 "name": name,
                 "cpus": ensure.cpus,
@@ -237,6 +315,8 @@ async fn ensure_running(client: &Client, name: &str, ensure: &Ensure) -> Result<
                 "mounts": mounts,
                 "backend": ensure.backend,
                 "network": ensure.network,
+                "allow": allow,
+                "secrets": secrets,
                 "idle_stop_minutes": ensure.idle_stop,
                 "start": true,
             });
@@ -344,6 +424,42 @@ fn print_vms(vms: &[VmStatus]) {
     }
 }
 
+fn print_egress(r: &EgressReport) {
+    let allow = if r.allow.is_empty() {
+        "(only the secrets' hosts)".to_string()
+    } else {
+        r.allow.join(" ")
+    };
+    if r.enforced {
+        println!("Network: allowlist. Reaches only: {allow}");
+    } else {
+        println!(
+            "Network: {}. The allowlist isn't enforced; the proxy only adds secrets.",
+            r.network
+        );
+    }
+    for s in &r.secrets {
+        println!("Secret {} goes only to {}", s.name, s.hosts.join(", "));
+    }
+    if r.log.is_empty() {
+        println!("Nothing has gone through the proxy since the VM started.");
+        return;
+    }
+    println!();
+    for e in &r.log {
+        let what = if e.allowed {
+            if e.secrets.is_empty() {
+                "allowed".to_string()
+            } else {
+                format!("allowed, added {}", e.secrets.join(", "))
+            }
+        } else {
+            format!("BLOCKED: {}", e.reason.as_deref().unwrap_or("refused"))
+        };
+        println!("{:<40} {:>5}  {what}", e.host, e.port);
+    }
+}
+
 fn show<T: serde::Serialize>(json: bool, value: &T, text: impl FnOnce()) {
     if json {
         println!(
@@ -397,6 +513,7 @@ async fn run(cli: Cli) -> Result<i32> {
             tags,
             backend,
             network,
+            egress,
             idle_stop,
             no_start,
         } => {
@@ -404,6 +521,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 .iter()
                 .map(|m| parse_mount(m))
                 .collect::<Result<Vec<_>>>()?;
+            let (allow, secrets) = egress.body(network)?;
             let spec = VmSpec {
                 name,
                 image,
@@ -416,6 +534,8 @@ async fn run(cli: Cli) -> Result<i32> {
                 backend,
                 network,
                 idle_stop_minutes: idle_stop,
+                allow,
+                secrets,
             };
             let mut body = serde_json::to_value(&spec)?;
             body["start"] = serde_json::json!(!no_start);
@@ -598,6 +718,19 @@ async fn run(cli: Cli) -> Result<i32> {
                 )
                 .await?;
             show(json, &f, || println!("{}", f.url));
+        }
+        Cmd::Egress { name } => {
+            let r: EgressReport = client()?.get(&format!("/vms/{name}/egress")).await?;
+            show(json, &r, || print_egress(&r));
+        }
+        Cmd::Allow { name, rules } => {
+            let r: EgressReport = client()?
+                .post(
+                    &format!("/vms/{name}/egress"),
+                    &serde_json::json!({ "allow": rules }),
+                )
+                .await?;
+            show(json, &r, || print_egress(&r));
         }
         Cmd::Mcp => mcp::serve(client()?).await?,
         Cmd::Version => version(json, host).await,

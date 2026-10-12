@@ -68,6 +68,10 @@ pub fn router(manager: Arc<Manager>, key: String) -> Router {
         .route("/vms/{name}/ports", get(ports))
         .route("/vms/{name}/forwards", post(forward))
         .route("/vms/{name}/forwards/{port}", delete(unforward))
+        .route(
+            "/vms/{name}/egress",
+            get(egress).put(set_egress).post(set_egress),
+        )
         .route_layer(middleware::from_fn_with_state(app.clone(), auth));
     Router::new()
         .route("/v1/health", get(health))
@@ -108,6 +112,7 @@ pub const FEATURES: &[&str] = &[
     "copy",
     "files",
     "stdin-eof",
+    "egress",
 ];
 
 /// Also lists `backend:<name>` for each backend that can run VMs here, and the one
@@ -324,6 +329,26 @@ async fn unforward(
     Ok(Json(serde_json::json!({ "removed": port })))
 }
 
+async fn egress(
+    State(app): State<App>,
+    Path(name): Path<String>,
+) -> ApiResult<cove_core::manager::EgressReport> {
+    Ok(Json(app.manager.egress(&name).await?))
+}
+
+#[derive(Deserialize)]
+struct EgressBody {
+    allow: Vec<String>,
+}
+
+async fn set_egress(
+    State(app): State<App>,
+    Path(name): Path<String>,
+    Json(body): Json<EgressBody>,
+) -> ApiResult<cove_core::manager::EgressReport> {
+    Ok(Json(app.manager.set_allow(&name, body.allow).await?))
+}
+
 /// WebSocket bridge to the guest. The first text message is a `Request` (exec, spawn
 /// or attach); after that, guest frames and client `Input` lines pass straight through.
 async fn stream(
@@ -438,6 +463,8 @@ pub async fn serve(manager: Arc<Manager>, listen: &str) -> Result<()> {
         manager.paths.root.display()
     );
     tokio::spawn(stop_idle_vms(manager.clone()));
+    // VMs that kept running while the server was down need their proxies back.
+    manager.resume().await;
     axum::serve(listener, router(manager, key))
         .with_graceful_shutdown(shutdown_signal())
         .await?;

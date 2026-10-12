@@ -467,6 +467,8 @@ mod tests {
                 backend: crate::backend::CLOUD_HYPERVISOR.into(),
                 network,
                 idle_stop_minutes: None,
+                allow: Vec::new(),
+                secrets: Vec::new(),
             },
             created_at: 0,
             instance_id: "x".into(),

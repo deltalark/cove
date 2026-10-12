@@ -57,7 +57,7 @@ pub fn runsc_flags(vm_dir: &Path, platform: &str, network: Network) -> Vec<Strin
             "--network={}",
             match network {
                 Network::Full => "sandbox",
-                Network::Off => "none",
+                Network::Off | Network::Allowlist => "none",
             }
         ),
         // The agent's socket, bound inside the sandbox, must be reachable from here.
@@ -293,7 +293,7 @@ pub fn launch(
             setup_netns(slot)?;
             Some(slot)
         }
-        Network::Off => None,
+        Network::Off | Network::Allowlist => None,
     };
     prepare_rootfs(record, &root)?;
     let bundle = vm_dir.join("bundle");
@@ -485,6 +485,8 @@ mod tests {
                 backend: crate::backend::GVISOR.into(),
                 network,
                 idle_stop_minutes: None,
+                allow: Vec::new(),
+                secrets: Vec::new(),
             },
             created_at: 0,
             instance_id: "x".into(),
