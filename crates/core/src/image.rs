@@ -343,7 +343,8 @@ pub async fn pull_rootfs(paths: &Paths, name: &str) -> Result<PathBuf> {
 pub fn unpack_layer(gzipped: &[u8], root: &Path) -> Result<()> {
     let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(gzipped));
     tar.set_preserve_permissions(true);
-    tar.set_preserve_ownerships(true);
+    // Only root can give files to other users; others unpack everything as themselves.
+    tar.set_preserve_ownerships(unsafe { libc::geteuid() } == 0);
     tar.set_unpack_xattrs(false);
     tar.set_overwrite(true);
     for entry in tar.entries()? {
