@@ -252,7 +252,9 @@ download_release() {
     else
       got="$(sha256sum "$tmp/$asset" | awk '{ print $1 }')"
     fi
-    [ -n "$want" ] && [ "$want" = "$got" ] || die "checksum mismatch for $asset; not installing it"
+    if [ -z "$want" ] || [ "$want" != "$got" ]; then
+      die "checksum mismatch for $asset; not installing it"
+    fi
   fi
   install_tarball "$tmp/$asset"
 }
@@ -396,7 +398,9 @@ install_gvisor() {
   curl -fsSL -o "$tmp/gvisor.tar.bz2.sha512" "$base/gvisor.tar.bz2.sha512"
   want="$(awk '{ print $1 }' "$tmp/gvisor.tar.bz2.sha512")"
   got="$(sha512sum "$tmp/gvisor.tar.bz2" | awk '{ print $1 }')"
-  [ -n "$want" ] && [ "$want" = "$got" ] || die "checksum mismatch for gVisor; not installing it"
+  if [ -z "$want" ] || [ "$want" != "$got" ]; then
+    die "checksum mismatch for gVisor; not installing it"
+  fi
   # runsc finds its helpers next to itself, so keep the release together.
   mkdir -p "$tmp/gvisor"
   tar -xjf "$tmp/gvisor.tar.bz2" -C "$tmp/gvisor"
