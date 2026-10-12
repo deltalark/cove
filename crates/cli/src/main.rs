@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use client::Client;
 use cove_core::model::{Mount, VmSpec};
 use cove_core::paths::Paths;
-use cove_core::{backend, image, Manager, VmStatus};
+use cove_core::{backend, image, Manager, Network, VmStatus};
 use cove_proto::{Command as GuestCommand, Request};
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:7457";
@@ -70,6 +70,13 @@ enum Cmd {
         /// vfkit, cloud-hypervisor or host (development only).
         #[arg(long, default_value = "")]
         backend: String,
+        /// full (NAT to the internet) or off (no network device at all).
+        #[arg(long, default_value = "full")]
+        network: Network,
+        /// Stop the VM after this many minutes with no commands, streams or running
+        /// named processes.
+        #[arg(long = "idle-stop", value_name = "MINUTES")]
+        idle_stop: Option<u64>,
         /// Create without starting.
         #[arg(long)]
         no_start: bool,
@@ -176,6 +183,8 @@ enum Cmd {
     },
     /// Run the MCP server (stdio) for agents.
     Mcp,
+    /// Print the client's and the server's version and the server's features.
+    Version,
 }
 
 /// Start the VM first if it is stopped, or create it if it doesn't exist.
@@ -194,6 +203,12 @@ struct Ensure {
     /// With --create: vfkit, cloud-hypervisor or host (development only).
     #[arg(long, env = "COVE_BACKEND", default_value = "")]
     backend: String,
+    /// With --create: full or off.
+    #[arg(long, default_value = "full")]
+    network: Network,
+    /// With --create: stop the VM after this many idle minutes.
+    #[arg(long = "idle-stop", value_name = "MINUTES")]
+    idle_stop: Option<u64>,
 }
 
 /// Make sure `name` is running: start it if stopped, create it with `--create`.
@@ -220,6 +235,8 @@ async fn ensure_running(client: &Client, name: &str, ensure: &Ensure) -> Result<
                 "memory_mb": ensure.memory,
                 "mounts": mounts,
                 "backend": ensure.backend,
+                "network": ensure.network,
+                "idle_stop_minutes": ensure.idle_stop,
                 "start": true,
             });
             match client.post::<VmStatus>("/vms", &body).await {
@@ -287,8 +304,8 @@ fn print_vms(vms: &[VmStatus]) {
         return;
     }
     println!(
-        "{:<20} {:<9} {:<10} {:>4} {:>8} {:>6}  MOUNTS",
-        "NAME", "STATE", "IMAGE", "CPU", "MEMORY", "DISK"
+        "{:<20} {:<9} {:<10} {:>4} {:>8} {:>6} {:<4} {:>5}  MOUNTS",
+        "NAME", "STATE", "IMAGE", "CPU", "MEMORY", "DISK", "NET", "IDLE"
     );
     for vm in vms {
         let state = serde_json::to_value(vm.state)
@@ -300,8 +317,12 @@ fn print_vms(vms: &[VmStatus]) {
             .iter()
             .map(|m| format!("{}:{}", m.host, m.guest))
             .collect();
+        let idle = vm
+            .idle_stop_minutes
+            .map(|m| format!("{m}m"))
+            .unwrap_or_else(|| "-".into());
         println!(
-            "{:<20} {:<9} {:<10} {:>4} {:>7}M {:>5}G  {}",
+            "{:<20} {:<9} {:<10} {:>4} {:>7}M {:>5}G {:<4} {:>5}  {}",
             vm.name,
             state,
             if vm.backend == backend::HOST {
@@ -312,6 +333,8 @@ fn print_vms(vms: &[VmStatus]) {
             vm.cpus,
             vm.memory_mb,
             vm.disk_gb,
+            vm.network,
+            idle,
             mounts.join(", ")
         );
         if let Some(e) = &vm.error {
@@ -371,6 +394,8 @@ async fn run(cli: Cli) -> Result<i32> {
             ephemeral,
             tags,
             backend,
+            network,
+            idle_stop,
             no_start,
         } => {
             let mounts = mounts
@@ -387,6 +412,8 @@ async fn run(cli: Cli) -> Result<i32> {
                 ephemeral,
                 tags,
                 backend,
+                network,
+                idle_stop_minutes: idle_stop,
             };
             let mut body = serde_json::to_value(&spec)?;
             body["start"] = serde_json::json!(!no_start);
@@ -571,8 +598,39 @@ async fn run(cli: Cli) -> Result<i32> {
             show(json, &f, || println!("{}", f.url));
         }
         Cmd::Mcp => mcp::serve(client()?).await?,
+        Cmd::Version => version(json, host).await,
     }
     Ok(0)
+}
+
+/// Ask the server what it is and can do. Needs no API key; when the server can't be
+/// reached, only the client's version is printed.
+async fn version(json: bool, host: Option<String>) {
+    let client_version = env!("CARGO_PKG_VERSION");
+    let url = client::server_url(host);
+    match client::health(&url).await {
+        Ok(health) => show(json, &health, || {
+            println!("cove {client_version} (client)");
+            println!(
+                "server {} at {url}",
+                health["version"].as_str().unwrap_or("?")
+            );
+            let features: Vec<&str> = health["features"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|f| f.as_str())
+                .collect();
+            if !features.is_empty() {
+                println!("features: {}", features.join(", "));
+            }
+        }),
+        Err(_) => show(
+            json,
+            &serde_json::json!({ "version": client_version }),
+            || println!("cove {client_version} (client; no server at {url})"),
+        ),
+    }
 }
 
 async fn doctor(client: Option<Client>) -> Result<i32> {

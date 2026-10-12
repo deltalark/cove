@@ -4,7 +4,7 @@
 //! not stop them; the server finds them again from `run.json`.
 
 use crate::guest::GuestAddr;
-use crate::model::VmRecord;
+use crate::model::{Network, VmRecord};
 use crate::paths::Paths;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -191,6 +191,8 @@ fn free_port() -> Result<u16> {
 pub fn launch(record: &VmRecord, vm_dir: &Path) -> Result<Launch> {
     let log = std::fs::File::create(vm_dir.join("backend.log"))?;
     let launch = match record.spec.backend.as_str() {
+        // The dev backend runs the agent as a plain host process, so it shares the
+        // host's network whatever `network` says; only real VMs enforce the policy.
         HOST => {
             for m in &record.spec.mounts {
                 if m.host != m.guest {
@@ -252,8 +254,14 @@ pub fn vfkit_args(record: &VmRecord, vm_dir: &Path) -> Vec<String> {
         format!("virtio-blk,path={}", d("disk.raw")),
         "--device".into(),
         format!("virtio-blk,path={}", d("seed.img")),
-        "--device".into(),
-        "virtio-net,nat".into(),
+    ];
+    // With the network off there is no NIC at all, not just no route: the guest
+    // agent talks over vsock, which needs none.
+    if record.spec.network == Network::Full {
+        args.push("--device".into());
+        args.push("virtio-net,nat".into());
+    }
+    args.extend([
         "--device".into(),
         format!(
             "virtio-vsock,port={},socketURL={},listen",
@@ -264,7 +272,7 @@ pub fn vfkit_args(record: &VmRecord, vm_dir: &Path) -> Vec<String> {
         "virtio-rng".into(),
         "--device".into(),
         format!("virtio-serial,logFilePath={}", d("console.log")),
-    ];
+    ]);
     for (i, m) in record.spec.mounts.iter().enumerate() {
         args.push("--device".into());
         args.push(format!(
@@ -298,6 +306,8 @@ mod tests {
                 ephemeral: false,
                 tags: vec![],
                 backend: VFKIT.into(),
+                network: Network::Full,
+                idle_stop_minutes: None,
             },
             created_at: 0,
             instance_id: "x".into(),
@@ -306,7 +316,33 @@ mod tests {
         assert!(args.starts_with(
             "--cpus 4 --memory 8192 --bootloader efi,variable-store=/vms/a/efi-vars,create"
         ));
+        assert!(args.contains("--device virtio-net,nat"));
         assert!(args.contains("--device virtio-vsock,port=1024,socketURL=/vms/a/guest.sock,listen"));
         assert!(args.ends_with("--device virtio-fs,sharedDir=/Users/me/app,mountTag=cove0"));
+    }
+
+    #[test]
+    fn vfkit_without_network() {
+        let record = VmRecord {
+            spec: VmSpec {
+                name: "a".into(),
+                image: "debian-13".into(),
+                cpus: 2,
+                memory_mb: 4096,
+                disk_gb: 20,
+                mounts: vec![],
+                ephemeral: false,
+                tags: vec![],
+                backend: VFKIT.into(),
+                network: Network::Off,
+                idle_stop_minutes: None,
+            },
+            created_at: 0,
+            instance_id: "x".into(),
+        };
+        let args = vfkit_args(&record, Path::new("/vms/a")).join(" ");
+        assert!(!args.contains("virtio-net"));
+        // The agent's channel is still there.
+        assert!(args.contains("virtio-vsock"));
     }
 }

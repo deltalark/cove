@@ -10,7 +10,7 @@ pub mod paths;
 pub mod seed;
 
 pub use manager::Manager;
-pub use model::{Mount, VmRecord, VmSpec, VmState, VmStatus};
+pub use model::{Mount, Network, VmRecord, VmSpec, VmState, VmStatus};
 
 /// Random lowercase hex, for ids and API keys.
 pub fn random_hex(bytes: usize) -> String {
