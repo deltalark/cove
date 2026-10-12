@@ -33,8 +33,9 @@ Coding agents are most useful when you let them run commands freely, and most da
 - **Live shared folders.** Share host folders into the VM with virtio-fs. Edit on your Mac and build in the VM, or the other way round.
 - **Processes that outlive your connection.** `cove spawn` starts a named process in the VM. Disconnect, come back later, and `cove attach` replays what you missed and keeps streaming. Agents keep working while your laptop sleeps.
 - **Ports in one command.** See what is listening inside a VM and forward it to your machine.
-- **Built for agents.** An MCP server lets any agent create VMs, run commands, move files and share ports.
-- **Real isolation.** A VM sees only the folders you share and the credentials you pass. Commands an agent runs there can't touch your home folder, keychain or SSH keys.
+- **Built for agents.** An MCP server lets any agent create VMs, run commands, start and watch background jobs, move files and share ports.
+- **Real isolation.** A VM sees only the folders you share and the credentials you pass. Commands an agent runs there can't touch your home folder, keychain or SSH keys. Turn its network off entirely for code you don't trust.
+- **Stops when you're done.** Give a VM an idle timer and it stops by itself once nothing has used it for that long, so forgotten agent VMs don't hold on to memory.
 
 ## Quick start
 
@@ -74,8 +75,24 @@ Want to check a fresh install end to end? `scripts/smoke-vm.sh` boots a VM and t
 | `cove push <name> <local> <remote>` · `cove pull <name> <remote> <local>` | Copy files in and out |
 | `cove ports <name>` · `cove forward <name> <port>` | List ports and forward one |
 | `cove mcp` | Run the MCP server over stdio |
+| `cove version` | Print the client's version, and the server's version and features |
 
-`cove up` takes `--cpus 2`, `--memory 4096` (MB), `--disk 20` (GB), any number of `--mount HOST:GUEST[:ro]`, `--ephemeral` and `--tag T`.
+`cove up` takes:
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| `--cpus N` | `2` | Virtual CPUs |
+| `--memory MB` | `4096` | Memory |
+| `--disk GB` | `20` | Disk size |
+| `--mount HOST:GUEST[:ro]` | | Share a folder; repeat for more |
+| `--network full\|off` | `full` | `full` is NAT to your network and the internet. `off` gives the VM no network device at all; Cove still reaches it over vsock |
+| `--idle-stop MINUTES` | off | Stop the VM after this many minutes with no commands, open streams, forwarded connections or running named processes |
+| `--ephemeral` | | Delete the VM when it stops |
+| `--tag T` | | Free-form labels; repeat for more |
+
+`cove exec` and `cove shell` start a stopped VM by themselves. With `--create` they also create a missing one, taking `--mount`, `--cpus`, `--memory`, `--network` and `--idle-stop` as above. `cove ls` shows each VM's network policy and idle timer.
+
+`cove exec` passes stdin through byte for byte and closes the command's stdin when yours ends, so `echo hi | cove exec dev -- cat` prints `hi`, and binary protocols such as `git upload-pack` run through it unchanged. Output waits for a slow reader instead of being dropped.
 
 Add `--json` to any command for machine-readable output, and `--host URL` to talk to another Cove server.
 
@@ -85,10 +102,10 @@ Every request carries `Authorization: Bearer <key>`. The key is created on first
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| `GET` | `/v1/health` | No auth |
+| `GET` | `/v1/health` | No auth. `ok, version, protocol, backend, features` |
 | `GET` | `/v1/images` | |
 | `POST` | `/v1/images/{name}/pull` | |
-| `GET` `POST` | `/v1/vms` | POST takes `name, image, cpus, memory_mb, disk_gb, mounts, ephemeral, tags, start` |
+| `GET` `POST` | `/v1/vms` | POST takes `name, image, cpus, memory_mb, disk_gb, mounts, ephemeral, tags, network, idle_stop_minutes, start` |
 | `GET` `DELETE` | `/v1/vms/{name}` | |
 | `POST` | `/v1/vms/{name}/start`, `/stop`, `/copy` | |
 | `POST` | `/v1/vms/{name}/exec` | Runs to completion and returns `code, stdout, stderr` |
@@ -101,6 +118,17 @@ Every request carries `Authorization: Bearer <key>`. The key is created on first
 | `POST` `DELETE` | `/v1/vms/{name}/forwards`, `/forwards/{port}` | |
 
 The stream's frames and requests are the types in [`crates/proto`](crates/proto/src/lib.rs).
+
+A VM's `network` is `"full"` (the default) or `"off"`, and `idle_stop_minutes` is a whole number of minutes, or left out for no timer. Both come back in every VM's status.
+
+`/v1/health` tells a client what the server can do before it relies on it:
+
+```json
+{ "ok": true, "version": "0.1.0", "protocol": 1, "backend": "vfkit",
+  "features": ["network", "idle-stop", "spawn", "attach", "forward", "copy", "files", "stdin-eof"] }
+```
+
+Features are only ever added, so check for the one you need rather than comparing versions.
 
 ```sh
 curl -s -H "Authorization: Bearer $(cove key)" -H "Content-Type: application/json" \
@@ -118,19 +146,32 @@ Give any MCP-capable agent its own machines:
 | Tool | What it does |
 | --- | --- |
 | `vm_list` | List VMs |
-| `vm_create` | Create and start a VM |
-| `vm_exec` | Run a command |
+| `vm_create` | Create and start a VM: `name`, and optionally `cpus`, `memory_mb`, `ephemeral`, `network` (`full` or `off`) and `idle_stop_minutes` |
+| `vm_exec` | Run a command and wait for it: `name`, `command`, `cwd` |
+| `vm_spawn` | Start a named background process that keeps running: `name`, `proc`, `command`, `cwd` |
+| `vm_logs` | A named process's output so far and whether it is still running, without waiting: `name`, `proc`, `from` (byte offset; each reply gives the next one) |
+| `vm_kill` | Signal a named process: `name`, `proc`, `signal` (SIGTERM by default) |
 | `vm_read_file` · `vm_write_file` | Read and write files |
 | `vm_share_port` | Forward a port to the host |
+| `vm_stop` · `vm_start` | Stop a VM, keeping its disk, or start it again |
+| `vm_copy` | Copy a stopped VM to a new name: `name`, `to` |
 | `vm_destroy` | Delete a VM |
+
+Agents can use `vm_spawn` and `vm_logs` for anything slower than a quick command: a build, a test suite, a dev server. Shell commands run as `bash -lc`.
 
 ## Cove and Runo
 
-Cove is built to work hand in hand with [Runo](https://github.com/deltalark/runo), the native app for running coding agents side by side. When `cove serve` is running, Runo's **New session** offers **Runs on: Cove VM**:
+Cove is built to work hand in hand with [Runo](https://github.com/deltalark/runo), the native app for running coding agents side by side. In Runo, a Cove server is a **Connection**: the one on your Mac, or a remote one added with its URL and API key (`cove key` on that machine prints it). Every session picks where it **Runs on**, your Mac or any connection, and can move between them at any time between agent turns.
 
-- The agent, the worktree setup command and terminal tabs run inside the session's own VM.
-- The session's worktree is shared into the VM at the same path, so git, diffs, commits and pull requests keep running on the Mac against the same files.
-- Only the API keys Runo passes explicitly reach the VM, and deleting the session deletes its VM.
+**On your Mac's Cove**, a session gets a VM of its own and its worktree is shared into the VM at the same path. The agent, the worktree setup command and terminal tabs run in the VM, while git, diffs, commits and pull requests keep running on the Mac against the same files. Moving a session between the Mac and the VM is instant, because there is nothing to copy.
+
+**On a remote Cove server**, the VM keeps its own copy of the worktree, and Runo syncs it in and out through git after every agent turn, uncommitted changes included. Git's data travels through `cove exec` itself, so the VM never needs access to GitHub just to sync. The agent's conversation travels with the worktree, so you can move a session from your laptop to a VM on a server, close the laptop, and later bring it back: the agent resumes the same conversation wherever it runs.
+
+**Runo's Cove settings** choose each connection's VM size, its network policy (`full`, or `off` for agents that shouldn't reach the internet) and its idle stop, so VMs on a server stop by themselves once their sessions go quiet. Only the API keys you list reach a VM, and deleting a session deletes its VM.
+
+**Agents use Cove too.** Through `cove mcp`, an agent in Runo can make scratch VMs of its own: to research something without touching the session's worktree, to run code it doesn't trust with the network off, or to hand a heavy build to a bigger machine with `vm_spawn` and check on it with `vm_logs`.
+
+Runo checks `/v1/health` to see which of these a server supports, so an older Cove keeps working for what it can do.
 
 ## How it works
 
@@ -160,7 +201,7 @@ flowchart LR
 
 ## Roadmap
 
-Cove is early. Here today: the macOS backend, the guest agent, the API, the CLI and the MCP server. Coming next:
+Cove is early. Here today: the macOS backend, the guest agent, the API, the CLI and the MCP server, with per-VM network policy and idle stop. Coming next:
 
 - [ ] Linux backend (cloud-hypervisor with KVM) for a VPS or bare metal
 - [ ] HTTPS proxy with a private-by-default URL for every VM
@@ -176,7 +217,9 @@ See [the full plan](docs/plan.md) for details and the security model.
 cargo build --workspace && cargo test --workspace
 ```
 
-The end-to-end tests use the `host` backend, which runs the guest agent as a normal process on your machine with **no isolation**. It is only allowed when the server runs with `COVE_ALLOW_HOST_BACKEND=1`, and exists so the whole stack can be tested without a hypervisor.
+The end-to-end tests use the `host` backend, which runs the guest agent as a normal process on your machine with **no isolation**. It is only allowed when the server runs with `COVE_ALLOW_HOST_BACKEND=1`, and exists so the whole stack can be tested without a hypervisor. It accepts `--network off` but can't enforce it: its commands share your machine's network.
+
+The server checks for idle VMs every 30 seconds. `COVE_IDLE_CHECK_SECS` changes that, and `COVE_IDLE_MINUTE_SECS` shortens what counts as a minute, so tests don't wait for real ones.
 
 ## License
 
