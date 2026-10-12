@@ -4,6 +4,7 @@
 pub mod backend;
 pub mod chv;
 pub mod guest;
+pub mod gvisor;
 pub mod image;
 pub mod manager;
 pub mod model;

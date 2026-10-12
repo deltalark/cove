@@ -14,22 +14,66 @@ use std::process::Stdio;
 pub const HOST: &str = "host";
 pub const VFKIT: &str = "vfkit";
 pub const CLOUD_HYPERVISOR: &str = "cloud-hypervisor";
+pub const GVISOR: &str = "gvisor";
 
-pub fn platform_default() -> &'static str {
+/// The backends this platform has, best first (`host` is for development only).
+pub fn platform_backends() -> &'static [&'static str] {
     if cfg!(target_os = "macos") {
-        VFKIT
+        &[VFKIT]
     } else {
-        CLOUD_HYPERVISOR
+        &[CLOUD_HYPERVISOR, GVISOR]
     }
+}
+
+/// The platform's main backend, for messages and `cove doctor`.
+pub fn platform_default() -> &'static str {
+    platform_backends()[0]
+}
+
+/// What `auto` picks: Apple's VMs on a Mac; on Linux, cloud-hypervisor when KVM is
+/// usable and it is installed, else gVisor when installed, else cloud-hypervisor if
+/// there is KVM (so the error says what to install), else nothing.
+pub fn choose_auto(
+    macos: bool,
+    kvm: bool,
+    cloud_hypervisor: bool,
+    runsc: bool,
+) -> std::result::Result<&'static str, String> {
+    if macos {
+        return Ok(VFKIT);
+    }
+    match (kvm, cloud_hypervisor, runsc) {
+        (true, true, _) => Ok(CLOUD_HYPERVISOR),
+        (_, _, true) => Ok(GVISOR),
+        (true, false, false) => Ok(CLOUD_HYPERVISOR),
+        (false, _, false) => Err(
+            "this machine has no KVM, so Cove needs gVisor to run VMs here: install it with \
+             scripts/install.sh, or see https://gvisor.dev/docs/user_guide/install/"
+                .into(),
+        ),
+    }
+}
+
+/// The backend `auto` picks on this machine.
+pub fn auto() -> std::result::Result<&'static str, String> {
+    choose_auto(
+        cfg!(target_os = "macos"),
+        crate::chv::kvm_check(Path::new("/dev/kvm")).is_ok(),
+        which("cloud-hypervisor").is_some(),
+        which("runsc").is_some(),
+    )
 }
 
 pub fn resolve(requested: &str) -> Result<&'static str> {
     Ok(match requested {
-        "" => platform_default(),
+        "" | "auto" => auto().map_err(anyhow::Error::msg)?,
         HOST => HOST,
         VFKIT => VFKIT,
         CLOUD_HYPERVISOR => CLOUD_HYPERVISOR,
-        other => bail!("unknown backend {other:?} (use vfkit, cloud-hypervisor or host)"),
+        GVISOR => GVISOR,
+        other => {
+            bail!("unknown backend {other:?} (use auto, vfkit, cloud-hypervisor, gvisor or host)")
+        }
     })
 }
 
@@ -76,6 +120,7 @@ pub fn check(backend: &str) -> std::result::Result<String, String> {
                 ),
             }
         }
+        GVISOR => crate::gvisor::check(),
         other => Err(format!("unknown backend {other:?}")),
     }
 }
@@ -134,9 +179,13 @@ impl Launch {
         pid_alive(self.pid)
     }
 
-    /// Stop the helpers; they exit by themselves when the VM does, but don't rely on it.
+    /// Clean up after the VM: stop helpers (they exit by themselves when the VM does,
+    /// but don't rely on it) and remove a gVisor sandbox's network namespace.
     pub fn stop_helpers(&self) {
         crate::chv::stop_helpers(&self.helpers);
+        if let (Some(slot), GuestAddr::Unix { .. }) = (self.net, &self.guest) {
+            crate::gvisor::teardown_netns(crate::chv::NetSlot(slot));
+        }
     }
 }
 
@@ -225,6 +274,8 @@ fn free_port() -> Result<u16> {
 pub struct LaunchOptions {
     pub firmware: Option<PathBuf>,
     pub net: Option<crate::chv::NetSlot>,
+    /// gVisor: the agent binary, bind-mounted into the sandbox.
+    pub guest_binary: Option<PathBuf>,
 }
 
 /// Boot the VM. Disks and the seed already exist in `vm_dir`.
@@ -314,6 +365,13 @@ pub fn launch(record: &VmRecord, vm_dir: &Path, opts: &LaunchOptions) -> Result<
                 helpers,
                 net: net.map(|n| n.0),
             }
+        }
+        GVISOR => {
+            let guest = opts
+                .guest_binary
+                .clone()
+                .context("no guest agent for the sandbox")?;
+            crate::gvisor::launch(record, vm_dir, &guest, opts.net, &log)?
         }
         other => bail!(check(other)
             .err()
@@ -470,8 +528,24 @@ mod launch_tests {
     fn linux_defaults_to_cloud_hypervisor() {
         if cfg!(target_os = "linux") {
             assert_eq!(platform_default(), CLOUD_HYPERVISOR);
+            assert_eq!(platform_backends(), [CLOUD_HYPERVISOR, GVISOR]);
         }
-        assert_eq!(resolve("").unwrap(), platform_default());
+        assert_eq!(resolve("gvisor").unwrap(), GVISOR);
         assert!(resolve("qemu").is_err());
+        assert!(resolve("container").is_err());
+    }
+
+    #[test]
+    fn auto_picks_the_strongest_available() {
+        assert_eq!(choose_auto(true, false, false, false), Ok(VFKIT));
+        assert_eq!(choose_auto(false, true, true, true), Ok(CLOUD_HYPERVISOR));
+        assert_eq!(choose_auto(false, true, true, false), Ok(CLOUD_HYPERVISOR));
+        // No KVM (or KVM but no cloud-hypervisor): gVisor if it is there.
+        assert_eq!(choose_auto(false, false, true, true), Ok(GVISOR));
+        assert_eq!(choose_auto(false, true, false, true), Ok(GVISOR));
+        // KVM but nothing installed: cloud-hypervisor, so the error says to install it.
+        assert_eq!(choose_auto(false, true, false, false), Ok(CLOUD_HYPERVISOR));
+        let refused = choose_auto(false, false, false, false).unwrap_err();
+        assert!(refused.contains("gVisor"), "{refused}");
     }
 }

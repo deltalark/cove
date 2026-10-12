@@ -683,3 +683,63 @@ fn mcp_tools_for_processes_and_lifecycle() {
     );
     assert!(text.contains("copied"), "{text}");
 }
+
+/// A real gVisor sandbox through the whole stack. Opt in with `COVE_GVISOR_E2E=1`: it
+/// needs root, `runsc` on PATH, a static guest agent in `COVE_GUEST_BINARY`, and
+/// network access to Docker Hub for the Debian rootfs.
+#[test]
+fn gvisor_sandbox_end_to_end() {
+    if std::env::var("COVE_GVISOR_E2E").as_deref() != Ok("1") {
+        eprintln!("set COVE_GVISOR_E2E=1 to run the gVisor test");
+        return;
+    }
+    let s = start_server();
+    s.ok(&["image", "pull", "debian-13"]);
+    let share = tempfile::tempdir().unwrap();
+    std::fs::write(share.path().join("in.txt"), "from host\n").unwrap();
+    let mount = format!("{}:/work", share.path().display());
+    let vm = s.json(&[
+        "up",
+        "gv",
+        "--backend",
+        "gvisor",
+        "--network",
+        "off",
+        "--cpus",
+        "2",
+        "--memory",
+        "1024",
+        "--mount",
+        &mount,
+    ]);
+    assert_eq!(vm["backend"], "gvisor");
+    assert_eq!(
+        s.ok(&["exec", "gv", "--", "cat", "/etc/debian_version"])
+            .trim()
+            .split('.')
+            .next(),
+        Some("13")
+    );
+    assert_eq!(s.ok(&["exec", "gv", "--", "nproc"]), "2\n");
+    assert_eq!(
+        s.ok(&["exec", "gv", "--", "cat", "/work/in.txt"]),
+        "from host\n"
+    );
+    let data: Vec<u8> = (0..300_000u32).map(|i| (i * 7 % 251) as u8).collect();
+    assert!(s.piped(&["exec", "gv", "--", "cat"], data.clone()).stdout == data);
+    // The disk persists across a restart, and copies keep it.
+    s.ok(&["exec", "gv", "--", "sh", "-c", "echo kept > /root/marker"]);
+    s.ok(&["stop", "gv"]);
+    s.ok(&["start", "gv"]);
+    assert_eq!(s.ok(&["exec", "gv", "--", "cat", "/root/marker"]), "kept\n");
+    s.ok(&["stop", "gv"]);
+    s.ok(&["copy", "gv", "gv-copy"]);
+    s.ok(&["start", "gv-copy"]);
+    assert_eq!(
+        s.ok(&["exec", "gv-copy", "--", "cat", "/root/marker"]),
+        "kept\n"
+    );
+    s.ok(&["rm", "gv-copy"]);
+    s.ok(&["rm", "gv"]);
+    assert_eq!(s.json(&["ls"]), serde_json::json!([]));
+}

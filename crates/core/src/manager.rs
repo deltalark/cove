@@ -277,13 +277,27 @@ impl Manager {
         if backend == backend::CLOUD_HYPERVISOR {
             crate::chv::check_spec(&spec, &crate::chv::Host::detect(&self.paths))?;
         }
+        if backend == backend::GVISOR {
+            crate::gvisor::check_spec(&spec, &crate::chv::Host::detect(&self.paths))?;
+        }
         let lock = self.lock(&spec.name).await;
         let _guard = lock.lock().await;
         let dir = self.paths.vm_dir(&spec.name);
         if dir.join("vm.json").exists() {
             bail!("a VM named {:?} already exists", spec.name);
         }
-        if backend != backend::HOST {
+        if backend == backend::GVISOR {
+            let base = image::rootfs_path(&self.paths, &spec.image);
+            if !base.is_dir() {
+                bail!(
+                    "image {:?} is not pulled yet: cove image pull {}",
+                    spec.image,
+                    spec.image
+                );
+            }
+            std::fs::create_dir_all(&dir)?;
+            crate::gvisor::copy_tree(&base, &crate::gvisor::rootfs(&dir))?;
+        } else if backend != backend::HOST {
             let base = image::disk_path(&self.paths, &spec.image);
             if !base.is_file() {
                 bail!(
@@ -351,12 +365,19 @@ impl Manager {
                 Some(f) => f,
                 None => image::pull_firmware(&self.paths).await?,
             });
-            if record.spec.network == Network::Full {
-                net_guard = Some(self.net_lock.lock().await);
-                opts.net = Some(crate::chv::free_slot(&self.net_slots_in_use())?);
-            }
         }
-        if record.spec.backend != backend::HOST {
+        if record.spec.backend == backend::GVISOR {
+            opts.guest_binary = Some(backend::guest_binary(&self.paths)?);
+        }
+        let vm = record.spec.backend == backend::CLOUD_HYPERVISOR
+            || record.spec.backend == backend::VFKIT;
+        let routed = record.spec.backend == backend::CLOUD_HYPERVISOR
+            || record.spec.backend == backend::GVISOR;
+        if routed && record.spec.network == Network::Full {
+            net_guard = Some(self.net_lock.lock().await);
+            opts.net = Some(crate::chv::free_slot(&self.net_slots_in_use())?);
+        }
+        if vm {
             let agent = backend::guest_binary(&self.paths)?;
             let network = opts.net.map(|n| n.network_config());
             seed::build(
@@ -393,7 +414,8 @@ impl Manager {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        if record.spec.backend != backend::HOST {
+        // Real VMs mount their virtio-fs shares; gVisor's are bind mounts already.
+        if vm {
             for (i, m) in record.spec.mounts.iter().enumerate() {
                 launch
                     .guest
@@ -418,7 +440,9 @@ impl Manager {
         if let Some(launch) = Launch::load(&dir) {
             if launch.alive() {
                 self.set_state(name, Some(VmState::Stopping), None).await;
-                if record.spec.backend != backend::HOST {
+                if record.spec.backend == backend::GVISOR {
+                    crate::gvisor::halt(name, &dir, &launch).await;
+                } else if record.spec.backend != backend::HOST {
                     let asked = tokio::time::timeout(
                         Duration::from_secs(5),
                         launch.guest.call(&Request::Shutdown),
@@ -466,6 +490,7 @@ impl Manager {
         }
         let lock = self.lock(name).await;
         let _guard = lock.lock().await;
+        crate::gvisor::release_mounts(&dir);
         std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
         self.live.lock().await.remove(name);
         Ok(())
@@ -501,6 +526,13 @@ impl Manager {
         std::fs::create_dir_all(&dir)?;
         if src_dir.join("disk.raw").is_file() {
             std::fs::copy(src_dir.join("disk.raw"), dir.join("disk.raw"))?;
+        }
+        let rootfs = crate::gvisor::rootfs(&src_dir);
+        if rootfs.is_dir() {
+            if let Err(e) = crate::gvisor::copy_tree(&rootfs, &crate::gvisor::rootfs(&dir)) {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(e);
+            }
         }
         let mut record = src.clone();
         record.spec.name = to.to_string();

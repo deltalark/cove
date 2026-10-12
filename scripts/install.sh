@@ -8,12 +8,13 @@
 # installs vfkit with Homebrew if it is missing, starts `cove serve` at login with a
 # launchd agent, checks the setup with `cove doctor` and pulls the default image.
 #
-# On Linux (a VPS or your own server) it installs cove and, when the machine has
-# KVM, what VMs need: cloud-hypervisor (the official static build, if it is
-# missing), virtiofsd and iptables (from the distribution), then a systemd service.
-# Run it as root there: VMs with a network need root. Without /dev/kvm (many cheap
-# VPS plans) it says so and installs only the CLI, which can drive a Cove server
-# elsewhere with --host.
+# On Linux (a VPS or your own server), run it as root. With KVM it installs what
+# VMs need: cloud-hypervisor (the official static build, if missing), virtiofsd,
+# iptables and iproute2 (from the distribution). Without KVM (many cheap VPS
+# plans) it offers gVisor instead, the official release with its checksum
+# checked, which runs each VM as a sandbox with its own user-space kernel. Then it
+# installs a systemd service. Declined, it installs only the CLI, which can drive
+# a Cove server elsewhere with --host.
 #
 # Running it again upgrades in place. Your VMs, images and API key in ~/.cove are
 # never touched, except by --uninstall --purge.
@@ -35,6 +36,7 @@ uninstall=0
 purge=0
 link=1
 deps=1
+gvisor=ask
 
 usage() {
   cat <<'EOF'
@@ -48,7 +50,9 @@ Usage: install.sh [options]
   --no-service        Don't start `cove serve` at login or boot
   --no-image          Don't pull the default image
   --no-link           Don't link cove into /opt/homebrew/bin or /usr/local/bin
-  --no-deps           Don't install vfkit, cloud-hypervisor, virtiofsd or iptables
+  --no-deps           Don't install vfkit, cloud-hypervisor, gVisor, virtiofsd or iptables
+  --gvisor            Without KVM, install gVisor without asking
+  --no-gvisor         Without KVM, don't install gVisor
   --from-source       Build from source with cargo instead of downloading
   --from-file FILE    Install from a release tarball you already have
   --uninstall         Remove Cove's binaries and service; keep VMs and data
@@ -78,6 +82,8 @@ while [ $# -gt 0 ]; do
     --no-image) image=0; shift ;;
     --no-link) link=0; shift ;;
     --no-deps) deps=0; shift ;;
+    --gvisor) gvisor=yes; shift ;;
+    --no-gvisor) gvisor=no; shift ;;
     --from-source) from_source=1; shift ;;
     --from-file) [ $# -ge 2 ] || die "--from-file needs a tarball"; from_file="$2"; shift 2 ;;
     --from-file=*) from_file="${1#*=}"; shift ;;
@@ -344,9 +350,17 @@ linux_deps() {
     mv -f /usr/local/bin/.cloud-hypervisor.new /usr/local/bin/cloud-hypervisor
     say "Installed /usr/local/bin/cloud-hypervisor"
   fi
+  install_packages
+}
+
+# virtiofsd for shared folders (VMs only), iptables and iproute2 for VM networks.
+install_packages() {
   missing=""
-  have_virtiofsd || missing=" virtiofsd"
+  if [ -e /dev/kvm ]; then
+    have_virtiofsd || missing=" virtiofsd"
+  fi
   have iptables || missing="$missing iptables"
+  have ip || missing="$missing iproute2"
   if [ -n "$missing" ]; then
     say "Installing$missing"
     if have apt-get; then
@@ -357,16 +371,67 @@ linux_deps() {
   fi
 }
 
+# Ask on the terminal even when the script itself comes from a pipe.
+confirm() {
+  if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    printf '%s [Y/n] ' "$1" >/dev/tty
+    read -r answer </dev/tty || answer=""
+    case "$answer" in
+      [Nn]*) return 1 ;;
+    esac
+    return 0
+  fi
+  # No terminal to ask on: go ahead, as a recommended default.
+  return 0
+}
+
+install_gvisor() {
+  if have runsc; then
+    say "gVisor is installed: $(runsc --version 2>/dev/null | head -n 1)"
+    return 0
+  fi
+  base="https://storage.googleapis.com/gvisor/releases/release/latest/$arch"
+  say "Downloading gVisor"
+  curl -fL --retry 2 --progress-bar -o "$tmp/gvisor.tar.bz2" "$base/gvisor.tar.bz2"
+  curl -fsSL -o "$tmp/gvisor.tar.bz2.sha512" "$base/gvisor.tar.bz2.sha512"
+  want="$(awk '{ print $1 }' "$tmp/gvisor.tar.bz2.sha512")"
+  got="$(sha512sum "$tmp/gvisor.tar.bz2" | awk '{ print $1 }')"
+  [ -n "$want" ] && [ "$want" = "$got" ] || die "checksum mismatch for gVisor; not installing it"
+  # runsc finds its helpers next to itself, so keep the release together.
+  mkdir -p "$tmp/gvisor"
+  tar -xjf "$tmp/gvisor.tar.bz2" -C "$tmp/gvisor"
+  [ -x "$tmp/gvisor/runsc" ] || die "the gVisor release has no runsc"
+  rm -rf /usr/local/lib/gvisor.new
+  mkdir -p /usr/local/lib
+  cp -R "$tmp/gvisor" /usr/local/lib/gvisor.new
+  rm -rf /usr/local/lib/gvisor
+  mv /usr/local/lib/gvisor.new /usr/local/lib/gvisor
+  ln -sf /usr/local/lib/gvisor/runsc /usr/local/bin/runsc
+  say "Installed gVisor: $(/usr/local/bin/runsc --version 2>/dev/null | head -n 1)"
+}
+
 backend_ready=0
 if [ "$os" = Linux ]; then
   step "Checking KVM"
   if [ -e /dev/kvm ]; then
-    say "/dev/kvm is present: this machine can run VMs"
+    say "/dev/kvm is present: this machine can run VMs with cloud-hypervisor"
     if [ "$deps" = 1 ]; then
       linux_deps
     fi
   else
-    say "/dev/kvm is missing, so this machine can't run Cove VMs. Installing only the CLI."
+    say "/dev/kvm is missing, so this machine can't run hardware VMs."
+    say "gVisor can run Cove VMs here instead, as sandboxes with their own user-space kernel:"
+    say "weaker than a VM, much stronger than a container, and no KVM needed."
+    if [ "$deps" = 0 ] || [ "$gvisor" = no ]; then
+      say "Not installing gVisor; installing only the CLI."
+    elif [ "$(id -u)" != 0 ]; then
+      warn "installing gVisor needs root; run this script with sudo to set it up"
+    elif have runsc || [ "$gvisor" = yes ] || confirm "Install gVisor?"; then
+      install_gvisor
+      install_packages
+    else
+      say "Not installing gVisor; installing only the CLI."
+    fi
   fi
 fi
 if [ "$os" = Darwin ] && [ "$deps" = 1 ]; then
@@ -499,9 +564,9 @@ if [ "$backend_ready" = 1 ]; then
   say "$listen: reach it through an SSH tunnel (ssh -L 7457:127.0.0.1:7457 this-server)"
   say "or put an HTTPS reverse proxy in front before opening it to the internet."
 elif [ "$os" = Linux ] && [ ! -e /dev/kvm ]; then
-  say "This machine has no /dev/kvm, so it can't run Cove VMs. On a VPS, pick a plan"
-  say "with KVM or nested virtualization, or a bare-metal server, and run this again."
-  say "Meanwhile the cove CLI drives a Cove server elsewhere:"
+  say "This machine has no /dev/kvm and no working gVisor, so it can't run Cove VMs."
+  say "Run this script again as root and accept gVisor (or pass --gvisor), or pick a VPS"
+  say "plan with KVM. Meanwhile the cove CLI drives a Cove server elsewhere:"
   say "  COVE_API_KEY=<key from \`cove key\` there> cove --host http://server:7457 ls"
 elif [ "$os" = Linux ]; then
   say "This machine has KVM, but something VMs need is missing: see \`cove doctor\` above."

@@ -110,13 +110,24 @@ pub const FEATURES: &[&str] = &[
     "stdin-eof",
 ];
 
+/// Also lists `backend:<name>` for each backend that can run VMs here, and the one
+/// `auto` picks as `backend` (null when none can).
 pub fn health_value() -> serde_json::Value {
+    let mut features: Vec<String> = FEATURES.iter().map(|f| f.to_string()).collect();
+    for b in cove_core::backend::platform_backends() {
+        if cove_core::backend::check(b).is_ok() {
+            features.push(format!("backend:{b}"));
+        }
+    }
+    let auto = cove_core::backend::auto()
+        .ok()
+        .filter(|b| cove_core::backend::check(b).is_ok());
     serde_json::json!({
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
         "protocol": cove_proto::PROTOCOL_VERSION,
-        "backend": cove_core::backend::platform_default(),
-        "features": FEATURES,
+        "backend": auto,
+        "features": features,
     })
 }
 
@@ -132,7 +143,9 @@ async fn pull_image(
     State(app): State<App>,
     Path(name): Path<String>,
 ) -> ApiResult<Vec<image::ImageInfo>> {
-    image::pull(&app.manager.paths, &name, &|_, _| {}).await?;
+    // Fetch the form the backend VMs get here boots from.
+    let backend = cove_core::backend::auto().unwrap_or(cove_core::backend::platform_default());
+    image::pull_for(&app.manager.paths, &name, backend).await?;
     Ok(Json(image::list(&app.manager.paths)))
 }
 

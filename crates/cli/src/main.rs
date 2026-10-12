@@ -67,8 +67,9 @@ enum Cmd {
         ephemeral: bool,
         #[arg(long = "tag")]
         tags: Vec<String>,
-        /// vfkit, cloud-hypervisor or host (development only).
-        #[arg(long, default_value = "")]
+        /// auto (the best this machine has), vfkit, cloud-hypervisor, gvisor or host
+        /// (development only).
+        #[arg(long, default_value = "auto")]
         backend: String,
         /// full (NAT to the internet) or off (no network device at all).
         #[arg(long, default_value = "full")]
@@ -200,8 +201,8 @@ struct Ensure {
     cpus: u32,
     #[arg(long, default_value_t = 4096)]
     memory: u64,
-    /// With --create: vfkit, cloud-hypervisor or host (development only).
-    #[arg(long, env = "COVE_BACKEND", default_value = "")]
+    /// With --create: auto, vfkit, cloud-hypervisor, gvisor or host (development only).
+    #[arg(long, env = "COVE_BACKEND", default_value = "auto")]
     backend: String,
     /// With --create: full or off.
     #[arg(long, default_value = "full")]
@@ -369,10 +370,11 @@ async fn run(cli: Cli) -> Result<i32> {
             let images: Vec<image::ImageInfo> = client()?.get("/images").await?;
             show(json, &images, || {
                 for i in &images {
-                    let state = if i.pulled {
-                        format!("pulled, {} MB", i.size / 1024 / 1024)
-                    } else {
-                        "not pulled".into()
+                    let state = match (i.size > 0, i.rootfs) {
+                        (true, true) => format!("pulled, {} MB disk and rootfs", i.size >> 20),
+                        (true, false) => format!("pulled, {} MB", i.size >> 20),
+                        (false, true) => "pulled, rootfs (gVisor)".into(),
+                        (false, false) => "not pulled".into(),
                     };
                     println!("{:<12} {:<45} {state}", i.name, i.description);
                 }
@@ -645,21 +647,36 @@ async fn doctor(client: Option<Client>) -> Result<i32> {
         "data folder",
         paths.root.display().to_string(),
     );
-    let backend = backend::platform_default();
-    match backend::check(backend) {
-        Ok(d) => line(true, "backend", d),
-        // The checks below say what's missing and how to fix it.
-        Err(_) if backend == backend::CLOUD_HYPERVISOR => line(
+    // Each backend this platform has, with what it needs; only one has to work, so
+    // only the one `auto` picks counts towards the result.
+    let mark = |good: bool| if good { "✓" } else { "✗" };
+    for b in backend::platform_backends() {
+        let result = backend::check(b);
+        println!(
+            "{} {b}: {}",
+            mark(result.is_ok()),
+            match &result {
+                Ok(d) => d.clone(),
+                Err(e) if *b == backend::CLOUD_HYPERVISOR => {
+                    format!("can't run VMs here ({})", e.split(':').next().unwrap_or(e))
+                }
+                Err(e) => e.clone(),
+            }
+        );
+        if *b == backend::CLOUD_HYPERVISOR {
+            for c in cove_core::chv::checks(&cove_core::chv::Host::detect(&paths)) {
+                println!("    {} {}: {}", mark(c.ok), c.label, c.detail);
+            }
+        }
+    }
+    match backend::auto().map(|b| (b, backend::check(b))) {
+        Ok((b, Ok(_))) => line(true, "backend", format!("{b} (what auto picks)")),
+        Ok((b, Err(e))) => line(
             false,
             "backend",
-            "cloud-hypervisor can't run VMs here yet; see below".into(),
+            format!("auto picks {b}, which can't run: {e}"),
         ),
         Err(e) => line(false, "backend", e),
-    }
-    if backend == backend::CLOUD_HYPERVISOR {
-        for c in cove_core::chv::checks(&cove_core::chv::Host::detect(&paths)) {
-            line(c.ok, c.label, c.detail);
-        }
     }
     match backend::guest_binary(&paths) {
         Ok(p) => line(true, "guest agent", p.display().to_string()),
