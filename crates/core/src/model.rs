@@ -41,6 +41,44 @@ pub struct VmSpec {
     /// activity. `None` keeps it running until stopped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_stop_minutes: Option<u64>,
+    /// Where a VM may connect through the egress proxy: `example.com`,
+    /// `*.example.com` (its subdomains), `*` (anywhere) or a preset such as `@dev`.
+    /// Enforced when `network` is `allowlist`; the hosts of `secrets` are always
+    /// allowed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    /// Secrets the egress proxy adds to requests, so their values never enter the VM.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<Secret>,
+}
+
+/// A secret kept on the host. Inside the VM, the variable `name` holds a placeholder;
+/// the egress proxy swaps it for `value` in the headers of HTTPS requests to `hosts`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Secret {
+    pub name: String,
+    pub value: String,
+    /// Where the secret may be sent. Empty uses the usual hosts for well-known names
+    /// (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GH_TOKEN`…).
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    /// What the VM sees instead of the value. Made by the server.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub placeholder: String,
+}
+
+/// A secret as the API reports it: never its value.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecretInfo {
+    pub name: String,
+    pub hosts: Vec<String>,
+}
+
+impl VmSpec {
+    /// Whether the VM's traffic goes through the egress proxy.
+    pub fn egress(&self) -> bool {
+        self.network == Network::Allowlist || !self.secrets.is_empty()
+    }
 }
 
 /// A VM's network policy.
@@ -52,6 +90,9 @@ pub enum Network {
     Full,
     /// No network device at all. The guest agent still works over vsock.
     Off,
+    /// No network device either: programs reach only the hosts on the VM's
+    /// allowlist, through the egress proxy on the host.
+    Allowlist,
 }
 
 impl Network {
@@ -59,7 +100,13 @@ impl Network {
         match self {
             Network::Full => "full",
             Network::Off => "off",
+            Network::Allowlist => "allowlist",
         }
+    }
+
+    /// Whether the VM gets a network device of its own.
+    pub fn device(self) -> bool {
+        self == Network::Full
     }
 }
 
@@ -75,8 +122,9 @@ impl std::str::FromStr for Network {
         match s {
             "full" => Ok(Network::Full),
             "off" => Ok(Network::Off),
+            "allowlist" => Ok(Network::Allowlist),
             other => Err(format!(
-                "unknown network policy {other:?} (use full or off)"
+                "unknown network policy {other:?} (use full, off or allowlist)"
             )),
         }
     }
@@ -131,6 +179,10 @@ pub struct VmStatus {
     pub network: Network,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_stop_minutes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<SecretInfo>,
     pub created_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,

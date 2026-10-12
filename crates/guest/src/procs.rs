@@ -75,8 +75,22 @@ fn with_defaults(command: &Command) -> Vec<(String, String)> {
     if command.pty.is_some() {
         env.push(("TERM".into(), "xterm-256color".into()));
     }
+    // The VM's own variables (the egress proxy, brokered secrets) come before the
+    // command's, so a command can still override them.
+    env.extend(vm_env());
     env.extend(command.env.iter().cloned());
     env
+}
+
+static VM_ENV: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+/// Variables every command in this VM gets, set by the host with `SetEnv`.
+pub fn set_vm_env(env: Vec<(String, String)>) {
+    *VM_ENV.lock().unwrap() = env;
+}
+
+fn vm_env() -> Vec<(String, String)> {
+    VM_ENV.lock().unwrap().clone()
 }
 
 impl Proc {

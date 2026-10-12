@@ -346,7 +346,7 @@ pub fn launch(record: &VmRecord, vm_dir: &Path, opts: &LaunchOptions) -> Result<
                     crate::chv::setup_nat()?;
                     Some(opts.net.context("no network slot for this VM")?)
                 }
-                Network::Off => None,
+                Network::Off | Network::Allowlist => None,
             };
             let helpers = crate::chv::start_virtiofsd(record, vm_dir, &log)?;
             let mut cmd = std::process::Command::new(program);
@@ -459,6 +459,8 @@ mod tests {
                 backend: VFKIT.into(),
                 network: Network::Full,
                 idle_stop_minutes: None,
+                allow: Vec::new(),
+                secrets: Vec::new(),
             },
             created_at: 0,
             instance_id: "x".into(),
@@ -487,6 +489,8 @@ mod tests {
                 backend: VFKIT.into(),
                 network: Network::Off,
                 idle_stop_minutes: None,
+                allow: Vec::new(),
+                secrets: Vec::new(),
             },
             created_at: 0,
             instance_id: "x".into(),

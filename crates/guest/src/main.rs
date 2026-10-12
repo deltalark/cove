@@ -3,6 +3,7 @@
 //! It listens on vsock port 1024 (or TCP/a unix socket for the dev backend) and
 //! serves the protocol in `cove-proto`: one request per connection.
 
+mod egress;
 mod procs;
 mod system;
 
@@ -262,6 +263,24 @@ fn handle(conn: Box<dyn Stream>) {
             send(&writer, &Frame::ok(true));
             system::power_off();
         }
+        Request::SetEnv { env } => {
+            procs::set_vm_env(env);
+            send(&writer, &Frame::ok(true));
+        }
+        Request::EgressAccept { port } => match egress::accept(port) {
+            Ok(conn) => {
+                if send(&writer, &Frame::ok(true)) {
+                    let buffered = reader.buffer().to_vec();
+                    pipe(reader.into_inner(), writer, conn, buffered);
+                } else {
+                    // The host stream went away while we waited: the next one takes it.
+                    egress::requeue(port, conn);
+                }
+            }
+            Err(e) => {
+                send(&writer, &Frame::error(e));
+            }
+        },
         Request::Tcp { port } => {
             let target = std::net::TcpStream::connect(("127.0.0.1", port))
                 .or_else(|_| std::net::TcpStream::connect(("::1", port)));

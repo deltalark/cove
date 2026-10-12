@@ -3,6 +3,7 @@
 
 pub mod backend;
 pub mod chv;
+pub mod egress;
 pub mod guest;
 pub mod gvisor;
 pub mod image;

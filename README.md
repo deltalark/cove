@@ -35,7 +35,9 @@ Coding agents are most useful when you let them run commands freely, and most da
 - **Processes that outlive your connection.** `cove spawn` starts a named process in the VM. Disconnect, come back later, and `cove attach` replays what you missed and keeps streaming. Agents keep working while your laptop sleeps.
 - **Ports in one command.** See what is listening inside a VM and forward it to your machine.
 - **Built for agents.** An MCP server lets any agent create VMs, run commands, start and watch background jobs, move files and share ports.
-- **Real isolation.** A VM sees only the folders you share and the credentials you pass. Commands an agent runs there can't touch your home folder, keychain or SSH keys. Turn its network off entirely for code you don't trust.
+- **Real isolation.** A VM sees only the folders you share. Commands an agent runs there can't touch your home folder, keychain or SSH keys. Turn its network off entirely for code you don't trust.
+- **Keys never enter the VM.** Give a VM your API keys and tokens as secrets: inside, it sees only placeholders, and Cove's proxy adds the real values to HTTPS requests for the hosts each secret belongs to. An agent can't leak what it never had.
+- **Only the hosts you allow.** With `--network allowlist` a VM has no network device at all and reaches only the hosts on its list, through Cove's proxy. Every connection it tries is logged, so you can see what an agent reached and what was blocked.
 - **Stops when you're done.** Give a VM an idle timer and it stops by itself once nothing has used it for that long, so forgotten agent VMs don't hold on to memory.
 
 ## Install
@@ -109,6 +111,8 @@ Want to check a machine end to end? `scripts/smoke-vm.sh` boots a VM and tests e
 | `cove procs <name>` · `cove kill <name> <proc>` | List or stop processes |
 | `cove push <name> <local> <remote>` · `cove pull <name> <remote> <local>` | Copy files in and out |
 | `cove ports <name>` · `cove forward <name> <port>` | List ports and forward one |
+| `cove egress <name>` | What a VM may reach, its secrets (names only), and what it tried to reach |
+| `cove allow <name> [rules...]` | Replace a VM's allowlist; a running VM uses it straight away |
 | `cove mcp` | Run the MCP server over stdio |
 | `cove version` | Print the client's version, and the server's version and features |
 
@@ -121,7 +125,9 @@ Want to check a machine end to end? `scripts/smoke-vm.sh` boots a VM and tests e
 | `--disk GB` | `20` | Disk size |
 | `--mount HOST:GUEST[:ro]` | | Share a folder; repeat for more |
 | `--backend NAME` | `auto` | `auto`, `vfkit`, `cloud-hypervisor` or `gvisor` (see [Where Cove runs](#where-cove-runs)) |
-| `--network full\|off` | `full` | `full` is NAT to your network and the internet. `off` gives the VM no network device at all (a gVisor sandbox gets loopback only); Cove still reaches it over its own channel |
+| `--network full\|off\|allowlist` | `full` | `full` is NAT to your network and the internet. `off` gives the VM no network device at all (a gVisor sandbox gets loopback only); Cove still reaches it over its own channel. `allowlist` has no network device either, and reaches only the `--allow` hosts through Cove's proxy (see [Secrets and the allowlist](#secrets-and-the-allowlist)) |
+| `--allow RULE` | `@dev` with `allowlist` | A host the VM may reach: `example.com`, `*.example.com` (its subdomains), `*`, or a preset: `@dev` (git hosts, package registries, Debian mirrors and model APIs) or `@agents` (model APIs and their sign-in hosts). Repeat for more |
+| `--secret NAME[@HOSTS]` | | Take `NAME` from your environment and keep it out of the VM; see below. Repeat for more |
 | `--idle-stop MINUTES` | off | Stop the VM after this many minutes with no commands, open streams, forwarded connections or running named processes |
 | `--ephemeral` | | Delete the VM when it stops |
 | `--tag T` | | Free-form labels; repeat for more |
@@ -141,7 +147,7 @@ Every request carries `Authorization: Bearer <key>`. The key is created on first
 | `GET` | `/v1/health` | No auth. `ok, version, protocol, backend, features` |
 | `GET` | `/v1/images` | |
 | `POST` | `/v1/images/{name}/pull` | |
-| `GET` `POST` | `/v1/vms` | POST takes `name, image, cpus, memory_mb, disk_gb, mounts, ephemeral, tags, backend, network, idle_stop_minutes, start` |
+| `GET` `POST` | `/v1/vms` | POST takes `name, image, cpus, memory_mb, disk_gb, mounts, ephemeral, tags, backend, network, allow, secrets, idle_stop_minutes, start`. `secrets` is a list of `{name, value, hosts}`; responses list only their names and hosts |
 | `GET` `DELETE` | `/v1/vms/{name}` | |
 | `POST` | `/v1/vms/{name}/start`, `/stop`, `/copy` | |
 | `POST` | `/v1/vms/{name}/exec` | Runs to completion and returns `code, stdout, stderr` |
@@ -152,17 +158,18 @@ Every request carries `Authorization: Bearer <key>`. The key is created on first
 | `GET` | `/v1/vms/{name}/dir?path=` | |
 | `GET` | `/v1/vms/{name}/ports` | Listening ports and forwards |
 | `POST` `DELETE` | `/v1/vms/{name}/forwards`, `/forwards/{port}` | |
+| `GET` `PUT` | `/v1/vms/{name}/egress` | `network, enforced, allow, secrets` (names and hosts) and `log`, the latest 200 connections with `host, port, allowed, reason, secrets`. PUT (or POST) `{"allow": [...]}` replaces the allowlist |
 
 The stream's frames and requests are the types in [`crates/proto`](crates/proto/src/lib.rs).
 
-A VM's `backend` is `"auto"` (the default) or a backend's name, `network` is `"full"` (the default) or `"off"`, and `idle_stop_minutes` is a whole number of minutes, or left out for no timer. All three come back in every VM's status, `backend` as the one it got.
+A VM's `backend` is `"auto"` (the default) or a backend's name, `network` is `"full"` (the default), `"off"` or `"allowlist"`, and `idle_stop_minutes` is a whole number of minutes, or left out for no timer. All three come back in every VM's status, `backend` as the one it got.
 
 `/v1/health` tells a client what the server can do before it relies on it:
 
 ```json
 { "ok": true, "version": "0.1.0", "protocol": 1, "backend": "gvisor",
   "features": ["network", "idle-stop", "spawn", "attach", "forward", "copy", "files", "stdin-eof",
-               "backend:gvisor"] }
+               "egress", "backend:gvisor"] }
 ```
 
 `backend` is what `auto` picks (or `null` when nothing can run VMs), and each `backend:<name>` feature is a backend that works on this server. Features are only ever added, so check for the one you need rather than comparing versions.
@@ -183,7 +190,8 @@ Give any MCP-capable agent its own machines:
 | Tool | What it does |
 | --- | --- |
 | `vm_list` | List VMs |
-| `vm_create` | Create and start a VM: `name`, and optionally `cpus`, `memory_mb`, `ephemeral`, `network` (`full` or `off`) and `idle_stop_minutes` |
+| `vm_create` | Create and start a VM: `name`, and optionally `cpus`, `memory_mb`, `ephemeral`, `network` (`full`, `off` or `allowlist`), `allow` and `idle_stop_minutes` |
+| `vm_egress` | What a VM may reach, its secrets' names, and the hosts it recently reached or was refused |
 | `vm_exec` | Run a command and wait for it: `name`, `command`, `cwd` |
 | `vm_spawn` | Start a named background process that keeps running: `name`, `proc`, `command`, `cwd` |
 | `vm_logs` | A named process's output so far and whether it is still running, without waiting: `name`, `proc`, `from` (byte offset; each reply gives the next one) |
@@ -195,6 +203,35 @@ Give any MCP-capable agent its own machines:
 | `vm_destroy` | Delete a VM |
 
 Agents can use `vm_spawn` and `vm_logs` for anything slower than a quick command: a build, a test suite, a dev server. Shell commands run as `bash -lc`.
+
+On purpose, MCP can't give a VM secrets or change an allowlist after the VM is made: an agent shouldn't be able to widen its own sandbox or hand your keys to a host of its choosing. People do that with the CLI or the API.
+
+## Secrets and the allowlist
+
+```console
+$ export ANTHROPIC_API_KEY=sk-ant-…
+$ cove up agent --mount ~/code/app:/work --network allowlist --allow @dev \
+    --secret ANTHROPIC_API_KEY --secret GH_TOKEN
+$ cove exec agent -- sh -c 'echo $ANTHROPIC_API_KEY'
+sk-ant-api03-cove5f0c…            # a placeholder, not your key
+$ cove egress agent
+Network: allowlist. Reaches only: @dev
+Secret ANTHROPIC_API_KEY goes only to api.anthropic.com
+Secret GH_TOKEN goes only to github.com, api.github.com
+
+api.anthropic.com                          443  allowed, added ANTHROPIC_API_KEY
+registry.npmjs.org                         443  allowed
+evil.example                               443  BLOCKED: not on this VM's allowlist
+```
+
+How it works:
+
+- **The proxy runs in `cove serve`, outside the VM.** Every command in the VM gets `HTTP_PROXY` and `HTTPS_PROXY` pointing at `127.0.0.1:3128` inside the VM, where the guest agent hands each connection to the server over its own channel. So an `allowlist` VM needs no network device, and on Linux no root for networking either.
+- **Secrets.** `--secret NAME` reads `NAME` from your environment (never from the command line, so it stays out of your shell history). The VM gets a placeholder that keeps the key's public prefix (`sk-ant-api03-`, `ghp_`), since some CLIs check it. For requests to that secret's hosts, the proxy terminates TLS with a certificate from Cove's own authority, which it installs in the VM, replaces the placeholder in the request headers (including inside `Basic` credentials, which is how git sends tokens), and sends the request on to the real server over TLS. Well-known names know their hosts: `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_AUTH_TOKEN` go to `api.anthropic.com`, `OPENAI_API_KEY` and `CODEX_API_KEY` to `api.openai.com`, `OPENROUTER_API_KEY` to `openrouter.ai`, `GEMINI_API_KEY` and `GOOGLE_API_KEY` to `generativelanguage.googleapis.com`, `GH_TOKEN` and `GITHUB_TOKEN` to `github.com` and `api.github.com`, `GITLAB_TOKEN` to `gitlab.com`. Name others with `--secret NAME@host,host`.
+- **Everything else passes straight through.** HTTPS to hosts without secrets is a plain `CONNECT` tunnel: the proxy checks the host name and never sees the traffic.
+- **What's never reachable:** this machine's own addresses and link-local ones such as the cloud metadata service. Private networks are reachable only for hosts allowed by exact name, so `*` doesn't open your LAN.
+- **With `--network full`**, secrets still work the same way, but the allowlist isn't enforced, since the VM has its own route out.
+- **Limits:** secrets are added to request headers only, over HTTPS. Brokered connections speak HTTP/1.1 (streaming responses work; WebSocket upgrades don't yet). Programs that ignore the proxy variables can't reach the network at all in an `allowlist` VM.
 
 ## Cove and Runo
 
@@ -248,6 +285,9 @@ Cove is early. Here today: the macOS backend, the guest agent, the API, the CLI 
 
 - [x] gVisor backend for Linux without KVM: built and tested end to end, from pulling the image to booting, exec, shared folders, restarts and copies
 - [ ] Linux backend with KVM (cloud-hypervisor): built and covered by unit tests; booting on a KVM host is still to be confirmed with `scripts/smoke-vm.sh`
+- [x] Secrets kept out of VMs, and an egress allowlist with a log
+- [ ] Golden environments: set a project up once and start every VM from it
+- [ ] Checkpoints and forks
 - [ ] HTTPS proxy with a private-by-default URL for every VM
 - [ ] Sharing VMs and previews
 - [ ] Pairing a remote Cove server with Runo

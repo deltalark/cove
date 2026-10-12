@@ -14,6 +14,10 @@ use serde::{Deserialize, Serialize};
 /// The vsock port `cove-guest` listens on inside every VM.
 pub const GUEST_PORT: u32 = 1024;
 
+/// Where, inside a VM, the guest agent accepts connections for the host's egress
+/// proxy. `HTTP_PROXY` and `HTTPS_PROXY` point here.
+pub const EGRESS_PORT: u16 = 3128;
+
 /// Bump when a change would break an older guest or host.
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -98,6 +102,18 @@ pub enum Request {
     },
     /// Power the guest off.
     Shutdown,
+    /// Set variables that every later command in the VM gets, under its own.
+    /// Replaces the previous set.
+    SetEnv {
+        env: Vec<(String, String)>,
+    },
+    /// Listen on `127.0.0.1:port` in the guest (once), wait for a program there to
+    /// connect, answer `Ok`, then pipe that connection's bytes through this stream.
+    /// The host keeps a few of these open so the guest can reach its egress proxy
+    /// without any network device.
+    EgressAccept {
+        port: u16,
+    },
 }
 
 /// Lines the host may send during a streaming request.

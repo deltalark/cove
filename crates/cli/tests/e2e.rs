@@ -743,3 +743,156 @@ fn gvisor_sandbox_end_to_end() {
     s.ok(&["rm", "gv"]);
     assert_eq!(s.json(&["ls"]), serde_json::json!([]));
 }
+
+/// A plain HTTP server on this machine that answers every request with its head.
+fn echo_server() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut conn in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if conn.read(&mut byte).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    head.push(byte[0]);
+                }
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    head.len()
+                );
+                let _ = conn.write_all(reply.as_bytes());
+                let _ = conn.write_all(&head);
+            });
+        }
+    });
+    port
+}
+
+#[test]
+fn allowlist_and_secrets_go_through_the_egress_proxy() {
+    let upstream = echo_server();
+    let guest_port = free_port().to_string();
+    let s = start_server_with(&[
+        // The dev backend's "VM" is this machine, so let it reach itself, and keep its
+        // proxy port away from anything else on this machine.
+        ("COVE_EGRESS_ALLOW_LOCAL", "1"),
+        ("COVE_EGRESS_GUEST_PORT", &guest_port),
+    ]);
+    let out = s
+        .cmd(&[
+            "--json",
+            "up",
+            "e1",
+            "--backend",
+            "host",
+            "--network",
+            "allowlist",
+            "--allow",
+            "localhost",
+            "--secret",
+            "TEST_TOKEN@api.example.com",
+        ])
+        .env("TEST_TOKEN", "real-value-123")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !text.contains("real-value-123"),
+        "the API showed a secret: {text}"
+    );
+    let vm: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(vm["network"], "allowlist");
+    assert_eq!(vm["allow"], serde_json::json!(["localhost"]));
+    assert_eq!(vm["secrets"][0]["name"], "TEST_TOKEN");
+    assert_eq!(
+        vm["secrets"][0]["hosts"],
+        serde_json::json!(["api.example.com"])
+    );
+
+    // Inside, the secret is a placeholder and the proxy is set for every command.
+    let env = s.ok(&[
+        "exec",
+        "e1",
+        "--",
+        "sh",
+        "-c",
+        "echo $TEST_TOKEN; echo $HTTPS_PROXY",
+    ]);
+    assert!(!env.contains("real-value-123"), "{env}");
+    assert!(env.contains("cove"), "{env}");
+    assert!(env.contains(&format!("127.0.0.1:{guest_port}")), "{env}");
+
+    // An allowed host answers through the proxy; others are refused.
+    let url = format!("http://localhost:{upstream}/hello");
+    let got = s.ok(&["exec", "e1", "--", "curl", "-s", "--noproxy", "", &url]);
+    assert!(got.contains("GET /hello HTTP/1.1"), "{got}");
+    let code = |s: &Server, url: &str| {
+        s.ok(&[
+            "exec",
+            "e1",
+            "--",
+            "curl",
+            "-s",
+            "--noproxy",
+            "",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            url,
+        ])
+    };
+    assert_eq!(code(&s, "http://example.org/"), "403");
+
+    // Both are in the log.
+    let report = s.json(&["egress", "e1"]);
+    let log = report["log"].as_array().unwrap();
+    assert!(log
+        .iter()
+        .any(|e| e["host"] == "localhost" && e["allowed"] == true));
+    assert!(log
+        .iter()
+        .any(|e| e["host"] == "example.org" && e["allowed"] == false));
+    assert_eq!(report["enforced"], true);
+
+    // A new allowlist applies at once.
+    s.ok(&["allow", "e1", "example.com"]);
+    assert_eq!(code(&s, &url), "403");
+    let shown = s.ok(&["egress", "e1"]);
+    assert!(shown.contains("Reaches only: example.com"), "{shown}");
+    assert!(shown.contains("BLOCKED"), "{shown}");
+    assert!(
+        shown.contains("TEST_TOKEN goes only to api.example.com"),
+        "{shown}"
+    );
+
+    // Bad rules and secrets are refused.
+    assert!(!s.run(&["allow", "e1", "http://x"]).status.success());
+    let missing = s.run(&[
+        "up",
+        "e2",
+        "--backend",
+        "host",
+        "--secret",
+        "NOT_SET_ANYWHERE_X",
+    ]);
+    assert!(!missing.status.success());
+    let unknown = s
+        .cmd(&["up", "e3", "--backend", "host", "--secret", "MY_THING"])
+        .env("MY_THING", "x")
+        .output()
+        .unwrap();
+    assert!(
+        !unknown.status.success(),
+        "a secret with no hosts was accepted"
+    );
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("hosts"));
+}

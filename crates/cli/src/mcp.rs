@@ -79,9 +79,15 @@ fn tools() -> Value {
                 "cpus": { "type": "integer" },
                 "memory_mb": { "type": "integer" },
                 "ephemeral": { "type": "boolean", "description": "delete it when stopped" },
-                "network": { "type": "string", "enum": ["full", "off"], "description": "full (default) or off: no network at all, for untrusted code" },
+                "network": { "type": "string", "enum": ["full", "off", "allowlist"], "description": "full (default); off: no network at all, for untrusted code; allowlist: only the hosts in `allow`" },
+                "allow": { "type": "array", "items": { "type": "string" }, "description": "with network allowlist: hosts it may reach (example.com, *.example.com) or presets (@dev: git hosts, package registries and model APIs; @agents: model APIs). Default @dev" },
                 "idle_stop_minutes": { "type": "integer", "description": "stop the VM after this many idle minutes" }
             }}
+        },
+        {
+            "name": "vm_egress",
+            "description": "Show what a VM may reach over the network, the names of the secrets Cove adds to its requests, and the hosts it recently reached or was refused.",
+            "inputSchema": { "type": "object", "required": ["name"], "properties": { "name": name } }
         },
         {
             "name": "vm_exec",
@@ -208,14 +214,23 @@ async fn call(client: &Client, tool: &str, args: &Value) -> Result<String> {
                 "memory_mb",
                 "ephemeral",
                 "network",
+                "allow",
                 "idle_stop_minutes",
             ] {
                 if !args[key].is_null() {
                     body[key] = args[key].clone();
                 }
             }
+            if body["network"] == "allowlist" && body["allow"].is_null() {
+                body["allow"] = json!(["@dev"]);
+            }
             let vm: VmStatus = client.post("/vms", &body).await?;
             Ok(format!("VM {} is running.", vm.name))
+        }
+        "vm_egress" => {
+            let name = arg(args, "name")?;
+            let r: Value = client.get(&format!("/vms/{name}/egress")).await?;
+            Ok(serde_json::to_string_pretty(&r)?)
         }
         "vm_exec" => {
             let name = arg(args, "name")?;
@@ -439,6 +454,7 @@ mod tests {
             "vm_stop",
             "vm_start",
             "vm_copy",
+            "vm_egress",
         ] {
             assert!(names.contains(&t), "{t} missing");
         }
@@ -450,8 +466,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             create["inputSchema"]["properties"]["network"]["enum"],
-            json!(["full", "off"])
+            json!(["full", "off", "allowlist"])
         );
+        assert!(create["inputSchema"]["properties"]["allow"].is_object());
+        // Agents can't hand a VM secrets or widen an allowlist through MCP.
+        assert!(create["inputSchema"]["properties"]["secrets"].is_null());
+        assert!(!names.contains(&"vm_allow"));
     }
 
     #[test]
