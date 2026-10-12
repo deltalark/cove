@@ -61,10 +61,21 @@ pub fn check(backend: &str) -> std::result::Result<String, String> {
                 None => Err("vfkit is not installed: brew install vfkit".into()),
             }
         }
-        CLOUD_HYPERVISOR => Err(
-            "the Linux backend (cloud-hypervisor) is not built yet; it is step 4 of the plan"
-                .into(),
-        ),
+        CLOUD_HYPERVISOR => {
+            if !cfg!(target_os = "linux") {
+                return Err("cloud-hypervisor runs on Linux only".into());
+            }
+            crate::chv::kvm_check(Path::new("/dev/kvm"))?;
+            match which("cloud-hypervisor") {
+                Some(p) => Ok(format!("cloud-hypervisor at {}", p.display())),
+                None => Err(
+                    "cloud-hypervisor is not installed: download cloud-hypervisor-static \
+                     from https://github.com/cloud-hypervisor/cloud-hypervisor/releases into \
+                     /usr/local/bin/cloud-hypervisor (scripts/install.sh does this)"
+                        .into(),
+                ),
+            }
+        }
         other => Err(format!("unknown backend {other:?}")),
     }
 }
@@ -72,8 +83,19 @@ pub fn check(backend: &str) -> std::result::Result<String, String> {
 pub fn which(program: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     let mut dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
-    // Homebrew isn't on PATH for launchd services.
-    dirs.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from));
+    // Homebrew isn't on PATH for launchd services, sbin often isn't for other users,
+    // and Debian and Ubuntu install virtiofsd outside PATH.
+    dirs.extend(
+        [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/sbin",
+            "/sbin",
+            "/usr/libexec",
+            "/usr/lib/qemu",
+        ]
+        .map(PathBuf::from),
+    );
     dirs.into_iter()
         .map(|d| d.join(program))
         .find(|p| p.is_file())
@@ -85,6 +107,12 @@ pub struct Launch {
     pub pid: u32,
     pub guest: GuestAddr,
     pub started_at: u64,
+    /// Helper processes that live as long as the VM (virtiofsd), stopped with it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub helpers: Vec<u32>,
+    /// cloud-hypervisor: the VM's network slot, so no other VM takes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net: Option<u32>,
 }
 
 impl Launch {
@@ -104,6 +132,11 @@ impl Launch {
 
     pub fn alive(&self) -> bool {
         pid_alive(self.pid)
+    }
+
+    /// Stop the helpers; they exit by themselves when the VM does, but don't rely on it.
+    pub fn stop_helpers(&self) {
+        crate::chv::stop_helpers(&self.helpers);
     }
 }
 
@@ -170,7 +203,7 @@ fn detach(cmd: &mut std::process::Command) {
 }
 
 /// Spawn and reap in the background so a finished VM doesn't linger as a zombie.
-fn spawn_detached(mut cmd: std::process::Command) -> Result<u32> {
+pub(crate) fn spawn_detached(mut cmd: std::process::Command) -> Result<u32> {
     detach(&mut cmd);
     let mut child = cmd
         .spawn()
@@ -187,8 +220,15 @@ fn free_port() -> Result<u16> {
     Ok(l.local_addr()?.port())
 }
 
+/// What a backend needs beyond the record. Only cloud-hypervisor uses these.
+#[derive(Debug, Default, Clone)]
+pub struct LaunchOptions {
+    pub firmware: Option<PathBuf>,
+    pub net: Option<crate::chv::NetSlot>,
+}
+
 /// Boot the VM. Disks and the seed already exist in `vm_dir`.
-pub fn launch(record: &VmRecord, vm_dir: &Path) -> Result<Launch> {
+pub fn launch(record: &VmRecord, vm_dir: &Path, opts: &LaunchOptions) -> Result<Launch> {
     let log = std::fs::File::create(vm_dir.join("backend.log"))?;
     let launch = match record.spec.backend.as_str() {
         // The dev backend runs the agent as a plain host process, so it shares the
@@ -213,6 +253,8 @@ pub fn launch(record: &VmRecord, vm_dir: &Path) -> Result<Launch> {
                     addr: format!("127.0.0.1:{port}"),
                 },
                 started_at: crate::now(),
+                helpers: vec![],
+                net: None,
             }
         }
         VFKIT => {
@@ -227,6 +269,50 @@ pub fn launch(record: &VmRecord, vm_dir: &Path) -> Result<Launch> {
                 pid: spawn_detached(cmd)?,
                 guest: GuestAddr::Unix { path: socket },
                 started_at: crate::now(),
+                helpers: vec![],
+                net: None,
+            }
+        }
+        CLOUD_HYPERVISOR => {
+            let program = which("cloud-hypervisor")
+                .context("cloud-hypervisor is not installed (see cove doctor)")?;
+            let firmware = opts
+                .firmware
+                .clone()
+                .context("no cloud-hypervisor firmware (see cove doctor)")?;
+            for stale in ["vsock.sock", "api.sock"] {
+                let _ = std::fs::remove_file(vm_dir.join(stale));
+            }
+            let net = match record.spec.network {
+                Network::Full => {
+                    crate::chv::setup_nat()?;
+                    Some(opts.net.context("no network slot for this VM")?)
+                }
+                Network::Off => None,
+            };
+            let helpers = crate::chv::start_virtiofsd(record, vm_dir, &log)?;
+            let mut cmd = std::process::Command::new(program);
+            cmd.args(crate::chv::cloud_hypervisor_args(
+                record, vm_dir, &firmware, net,
+            ))
+            .stdout(log.try_clone()?)
+            .stderr(log);
+            let pid = match spawn_detached(cmd) {
+                Ok(pid) => pid,
+                Err(e) => {
+                    crate::chv::stop_helpers(&helpers);
+                    return Err(e);
+                }
+            };
+            Launch {
+                pid,
+                guest: GuestAddr::HybridVsock {
+                    path: vm_dir.join("vsock.sock"),
+                    port: cove_proto::GUEST_PORT,
+                },
+                started_at: crate::now(),
+                helpers,
+                net: net.map(|n| n.0),
             }
         }
         other => bail!(check(other)
@@ -344,5 +430,48 @@ mod tests {
         assert!(!args.contains("virtio-net"));
         // The agent's channel is still there.
         assert!(args.contains("virtio-vsock"));
+    }
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::*;
+
+    #[test]
+    fn run_json_round_trips_and_old_files_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let launch = Launch {
+            pid: 42,
+            guest: GuestAddr::HybridVsock {
+                path: dir.path().join("vsock.sock"),
+                port: 1024,
+            },
+            started_at: 7,
+            helpers: vec![43, 44],
+            net: Some(3),
+        };
+        launch.save(dir.path()).unwrap();
+        let back = Launch::load(dir.path()).unwrap();
+        assert_eq!(back.guest, launch.guest);
+        assert_eq!((back.helpers, back.net), (vec![43, 44], Some(3)));
+        // run.json from before helpers and network slots existed.
+        std::fs::write(
+            dir.path().join("run.json"),
+            r#"{"pid":1,"guest":{"kind":"unix","path":"/x"},"started_at":0}"#,
+        )
+        .unwrap();
+        let old = Launch::load(dir.path()).unwrap();
+        assert!(old.helpers.is_empty() && old.net.is_none());
+        Launch::clear(dir.path());
+        assert!(Launch::load(dir.path()).is_none());
+    }
+
+    #[test]
+    fn linux_defaults_to_cloud_hypervisor() {
+        if cfg!(target_os = "linux") {
+            assert_eq!(platform_default(), CLOUD_HYPERVISOR);
+        }
+        assert_eq!(resolve("").unwrap(), platform_default());
+        assert!(resolve("qemu").is_err());
     }
 }

@@ -2,6 +2,7 @@
 //! seeds, backends that boot VMs, and the client that talks to the guest agent.
 
 pub mod backend;
+pub mod chv;
 pub mod guest;
 pub mod image;
 pub mod manager;

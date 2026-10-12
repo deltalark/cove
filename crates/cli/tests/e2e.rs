@@ -359,7 +359,7 @@ fn piped_stdin_reaches_exec_and_closes() {
     assert!(out.stdout == data, "binary data changed on the way");
 
     // More output than the guest's replay buffer (16 MB), read late, arrives whole.
-    let mut child = s
+    let child = s
         .cmd(&["exec", "t6", "--", "head", "-c", "20000000", "/dev/zero"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

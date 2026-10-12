@@ -2,7 +2,7 @@
 
 use crate::backend::{self, Launch};
 use crate::guest::GuestAddr;
-use crate::model::{Forward, VmRecord, VmSpec, VmState, VmStatus};
+use crate::model::{Forward, Network, VmRecord, VmSpec, VmState, VmStatus};
 use crate::paths::Paths;
 use crate::{image, seed};
 use anyhow::{anyhow, bail, Context, Result};
@@ -51,6 +51,8 @@ pub struct Manager {
     activity: std::sync::Mutex<HashMap<String, Activity>>,
     /// Serialises lifecycle changes per VM.
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Held from picking a network slot until the VM holding it is recorded.
+    net_lock: Mutex<()>,
     /// Host name used in forwarded-port URLs.
     pub url_host: String,
 }
@@ -63,6 +65,7 @@ impl Manager {
             live: Mutex::new(HashMap::new()),
             activity: std::sync::Mutex::new(HashMap::new()),
             locks: Mutex::new(HashMap::new()),
+            net_lock: Mutex::new(()),
             url_host: "127.0.0.1".into(),
         }))
     }
@@ -149,6 +152,16 @@ impl Manager {
         let entry = live.entry(name.to_string()).or_default();
         entry.state = state;
         entry.error = error;
+    }
+
+    /// Network slots held by running VMs.
+    fn net_slots_in_use(&self) -> Vec<u32> {
+        self.names()
+            .iter()
+            .filter_map(|n| Launch::load(&self.paths.vm_dir(n)))
+            .filter(|l| l.alive())
+            .filter_map(|l| l.net)
+            .collect()
     }
 
     /// The guest agent of a running VM. Counts as activity for idle stop; the idle
@@ -261,6 +274,9 @@ impl Manager {
                 bail!("{} is not a folder on this machine", m.host);
             }
         }
+        if backend == backend::CLOUD_HYPERVISOR {
+            crate::chv::check_spec(&spec, &crate::chv::Host::detect(&self.paths))?;
+        }
         let lock = self.lock(&spec.name).await;
         let _guard = lock.lock().await;
         let dir = self.paths.vm_dir(&spec.name);
@@ -316,6 +332,7 @@ impl Manager {
             Err(e) => {
                 if let Some(l) = Launch::load(&dir) {
                     backend::signal(l.pid, libc::SIGKILL);
+                    l.stop_helpers();
                 }
                 Launch::clear(&dir);
                 self.set_state(name, None, Some(format!("{e:#}"))).await;
@@ -327,16 +344,31 @@ impl Manager {
     }
 
     async fn boot(&self, record: &VmRecord, dir: &Path) -> Result<()> {
+        let mut opts = backend::LaunchOptions::default();
+        let mut net_guard = None;
+        if record.spec.backend == backend::CLOUD_HYPERVISOR {
+            opts.firmware = Some(match crate::chv::firmware(&self.paths) {
+                Some(f) => f,
+                None => image::pull_firmware(&self.paths).await?,
+            });
+            if record.spec.network == Network::Full {
+                net_guard = Some(self.net_lock.lock().await);
+                opts.net = Some(crate::chv::free_slot(&self.net_slots_in_use())?);
+            }
+        }
         if record.spec.backend != backend::HOST {
             let agent = backend::guest_binary(&self.paths)?;
+            let network = opts.net.map(|n| n.network_config());
             seed::build(
                 &dir.join("seed.img"),
                 &record.instance_id,
                 &record.spec.name,
                 &agent,
+                network.as_deref(),
             )?;
         }
-        let launch = backend::launch(record, dir)?;
+        let launch = backend::launch(record, dir, &opts)?;
+        drop(net_guard);
         let deadline = tokio::time::Instant::now() + BOOT_TIMEOUT;
         loop {
             if !launch.alive() {
@@ -387,11 +419,17 @@ impl Manager {
             if launch.alive() {
                 self.set_state(name, Some(VmState::Stopping), None).await;
                 if record.spec.backend != backend::HOST {
-                    let _ = tokio::time::timeout(
+                    let asked = tokio::time::timeout(
                         Duration::from_secs(5),
                         launch.guest.call(&Request::Shutdown),
                     )
                     .await;
+                    // The agent didn't answer: press the power button instead.
+                    if !matches!(asked, Ok(Ok(_)))
+                        && record.spec.backend == backend::CLOUD_HYPERVISOR
+                    {
+                        let _ = crate::chv::power_button(&dir).await;
+                    }
                 } else {
                     backend::signal(launch.pid, libc::SIGTERM);
                 }
@@ -407,6 +445,7 @@ impl Manager {
                     backend::signal(launch.pid, libc::SIGKILL);
                 }
             }
+            launch.stop_helpers();
             Launch::clear(&dir);
         }
         self.activity.lock().unwrap().remove(name);

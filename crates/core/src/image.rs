@@ -155,5 +155,34 @@ pub async fn pull(
     .await??;
     let _ = std::fs::remove_file(&archive);
     crate::paths::restrict(&target, 0o444);
+    // cloud-hypervisor boots the same disk with its own EFI firmware.
+    if cfg!(target_os = "linux") && crate::chv::firmware(paths).is_none() {
+        pull_firmware(paths).await?;
+    }
+    Ok(target)
+}
+
+/// Download cloud-hypervisor's EDK2 firmware for this architecture into
+/// `~/.cove/firmware`.
+pub async fn pull_firmware(paths: &Paths) -> Result<PathBuf> {
+    let name = crate::chv::firmware_name();
+    let dir = paths.firmware_dir();
+    std::fs::create_dir_all(&dir)?;
+    let url = format!("{}{name}", crate::chv::FIRMWARE_URL);
+    let data = reqwest::get(&url)
+        .await
+        .and_then(|r| r.error_for_status())
+        .with_context(|| format!("downloading {url}"))?
+        .bytes()
+        .await?;
+    // A firmware volume is a few MB; anything tiny is an error page.
+    if data.len() < 512 * 1024 {
+        bail!("{url} doesn't look like firmware ({} bytes)", data.len());
+    }
+    let target = dir.join(name);
+    let partial = dir.join(format!("{name}.partial"));
+    std::fs::write(&partial, &data)?;
+    std::fs::rename(&partial, &target)?;
+    crate::paths::restrict(&target, 0o444);
     Ok(target)
 }

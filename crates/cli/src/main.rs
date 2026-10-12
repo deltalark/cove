@@ -648,7 +648,18 @@ async fn doctor(client: Option<Client>) -> Result<i32> {
     let backend = backend::platform_default();
     match backend::check(backend) {
         Ok(d) => line(true, "backend", d),
+        // The checks below say what's missing and how to fix it.
+        Err(_) if backend == backend::CLOUD_HYPERVISOR => line(
+            false,
+            "backend",
+            "cloud-hypervisor can't run VMs here yet; see below".into(),
+        ),
         Err(e) => line(false, "backend", e),
+    }
+    if backend == backend::CLOUD_HYPERVISOR {
+        for c in cove_core::chv::checks(&cove_core::chv::Host::detect(&paths)) {
+            line(c.ok, c.label, c.detail);
+        }
     }
     match backend::guest_binary(&paths) {
         Ok(p) => line(true, "guest agent", p.display().to_string()),
