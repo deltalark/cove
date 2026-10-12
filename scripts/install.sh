@@ -8,10 +8,12 @@
 # installs vfkit with Homebrew if it is missing, starts `cove serve` at login with a
 # launchd agent, checks the setup with `cove doctor` and pulls the default image.
 #
-# On Linux it installs the cove CLI. Cove can't run VMs on Linux yet (the
-# cloud-hypervisor backend is still to come), so there the CLI drives a Cove server
-# elsewhere with --host. Once `cove doctor` reports a working backend, the same
-# script installs a systemd service as well.
+# On Linux (a VPS or your own server) it installs cove and, when the machine has
+# KVM, what VMs need: cloud-hypervisor (the official static build, if it is
+# missing), virtiofsd and iptables (from the distribution), then a systemd service.
+# Run it as root there: VMs with a network need root. Without /dev/kvm (many cheap
+# VPS plans) it says so and installs only the CLI, which can drive a Cove server
+# elsewhere with --host.
 #
 # Running it again upgrades in place. Your VMs, images and API key in ~/.cove are
 # never touched, except by --uninstall --purge.
@@ -32,6 +34,7 @@ from_file=""
 uninstall=0
 purge=0
 link=1
+deps=1
 
 usage() {
   cat <<'EOF'
@@ -45,6 +48,7 @@ Usage: install.sh [options]
   --no-service        Don't start `cove serve` at login or boot
   --no-image          Don't pull the default image
   --no-link           Don't link cove into /opt/homebrew/bin or /usr/local/bin
+  --no-deps           Don't install vfkit, cloud-hypervisor, virtiofsd or iptables
   --from-source       Build from source with cargo instead of downloading
   --from-file FILE    Install from a release tarball you already have
   --uninstall         Remove Cove's binaries and service; keep VMs and data
@@ -73,6 +77,7 @@ while [ $# -gt 0 ]; do
     --no-service) service=0; shift ;;
     --no-image) image=0; shift ;;
     --no-link) link=0; shift ;;
+    --no-deps) deps=0; shift ;;
     --from-source) from_source=1; shift ;;
     --from-file) [ $# -ge 2 ] || die "--from-file needs a tarball"; from_file="$2"; shift 2 ;;
     --from-file=*) from_file="${1#*=}"; shift ;;
@@ -305,8 +310,66 @@ for dir in $([ "$link" = 1 ] && link_dirs); do
   fi
 done
 
+# Install a distribution package if its program is missing.
+pkg_install() {
+  if have apt-get; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" >/dev/null
+  elif have dnf; then
+    dnf install -y -q "$@"
+  else
+    return 1
+  fi
+}
+
+# Debian and Ubuntu put virtiofsd outside PATH.
+have_virtiofsd() {
+  have virtiofsd || [ -x /usr/libexec/virtiofsd ] || [ -x /usr/lib/qemu/virtiofsd ]
+}
+
+linux_deps() {
+  if [ "$(id -u)" != 0 ]; then
+    warn "not root, so skipping cloud-hypervisor, virtiofsd and iptables; run with sudo to set up VMs"
+    return 0
+  fi
+  if have cloud-hypervisor; then
+    say "cloud-hypervisor is installed"
+  else
+    ch_asset=cloud-hypervisor-static
+    [ "$arch" = aarch64 ] && ch_asset=cloud-hypervisor-static-aarch64
+    say "Downloading cloud-hypervisor ($ch_asset)"
+    curl -fL --retry 2 --progress-bar -o "$tmp/cloud-hypervisor" \
+      "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/latest/download/$ch_asset"
+    cp "$tmp/cloud-hypervisor" /usr/local/bin/.cloud-hypervisor.new
+    chmod 0755 /usr/local/bin/.cloud-hypervisor.new
+    mv -f /usr/local/bin/.cloud-hypervisor.new /usr/local/bin/cloud-hypervisor
+    say "Installed /usr/local/bin/cloud-hypervisor"
+  fi
+  missing=""
+  have_virtiofsd || missing=" virtiofsd"
+  have iptables || missing="$missing iptables"
+  if [ -n "$missing" ]; then
+    say "Installing$missing"
+    if have apt-get; then
+      apt-get update -qq >/dev/null || true
+    fi
+    # shellcheck disable=SC2086 # one word per package
+    pkg_install $missing || warn "could not install$missing; install it yourself (shared folders need virtiofsd, VM networking needs iptables)"
+  fi
+}
+
 backend_ready=0
-if [ "$os" = Darwin ]; then
+if [ "$os" = Linux ]; then
+  step "Checking KVM"
+  if [ -e /dev/kvm ]; then
+    say "/dev/kvm is present: this machine can run VMs"
+    if [ "$deps" = 1 ]; then
+      linux_deps
+    fi
+  else
+    say "/dev/kvm is missing, so this machine can't run Cove VMs. Installing only the CLI."
+  fi
+fi
+if [ "$os" = Darwin ] && [ "$deps" = 1 ]; then
   step "Checking vfkit"
   if have vfkit || [ -x /opt/homebrew/bin/vfkit ] || [ -x /usr/local/bin/vfkit ]; then
     say "vfkit is installed"
@@ -428,18 +491,23 @@ if [ "$backend_ready" = 1 ]; then
   else
     say "Start the server with:  cove serve"
   fi
-  say "Runo finds this machine's Cove by itself. To use it from another machine, run"
-  say "\`cove key\` here and add a Cove connection in Runo with this server's URL and key."
-elif [ "$os" = Linux ]; then
-  if [ -e /dev/kvm ]; then
-    say "This machine has KVM, but Cove can't run VMs on Linux yet: the cloud-hypervisor"
-    say "backend is still to come. Run this script again once it lands to add the service."
-  else
-    say "Cove can't run VMs on Linux yet (the cloud-hypervisor backend is still to come),"
-    say "and this machine has no /dev/kvm, which that backend will need."
+  if [ "$os" = Darwin ]; then
+    say "Runo finds this machine's Cove by itself."
   fi
+  say "To use it from Runo on another machine, run \`cove key\` here and add a Cove"
+  say "connection in Runo with this server's URL and that key. The API is plain HTTP on"
+  say "$listen: reach it through an SSH tunnel (ssh -L 7457:127.0.0.1:7457 this-server)"
+  say "or put an HTTPS reverse proxy in front before opening it to the internet."
+elif [ "$os" = Linux ] && [ ! -e /dev/kvm ]; then
+  say "This machine has no /dev/kvm, so it can't run Cove VMs. On a VPS, pick a plan"
+  say "with KVM or nested virtualization, or a bare-metal server, and run this again."
   say "Meanwhile the cove CLI drives a Cove server elsewhere:"
   say "  COVE_API_KEY=<key from \`cove key\` there> cove --host http://server:7457 ls"
+elif [ "$os" = Linux ]; then
+  say "This machine has KVM, but something VMs need is missing: see \`cove doctor\` above."
+  if [ "$(id -u)" != 0 ]; then
+    say "Running this script as root (sudo) installs what's missing and the service."
+  fi
 else
   say "Fix what \`cove doctor\` reports above, then run this script again."
 fi

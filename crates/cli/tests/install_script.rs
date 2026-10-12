@@ -1,6 +1,6 @@
 //! `scripts/install.sh`: it parses, passes shellcheck when that is installed, and on
 //! Linux installs a release tarball into a scratch home, upgrades it in place and
-//! uninstalls it again, without touching the network or the real system.
+//! uninstalls it again, without touching the network, services or system folders.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -94,13 +94,15 @@ fn installs_upgrades_and_uninstalls_from_a_tarball() {
         tarball.to_str().unwrap(),
         "--no-link",
         "--no-service",
+        "--no-deps",
     ];
     let text = run(&install);
     let bin = home.join(".cove/bin");
     assert!(bin.join("cove").is_file());
     assert!(bin.join("cove-guest-linux-x86_64").is_file());
-    // Honest about Linux: no VMs here yet, so no service either.
-    assert!(text.contains("can't run VMs on Linux yet"), "{text}");
+    assert!(text.contains("Installed cove "), "{text}");
+    // Whether or not this machine has KVM, it says so.
+    assert!(text.contains("/dev/kvm"), "{text}");
     // Running it again upgrades in place.
     run(&install);
     assert!(bin.join("cove").is_file());
