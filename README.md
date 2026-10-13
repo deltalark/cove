@@ -14,17 +14,20 @@ driven from a CLI, an HTTP API or MCP.
 ![Linux · KVM or gVisor](https://img.shields.io/badge/Linux-KVM%20or%20gVisor-lightgrey?logo=linux&logoColor=white)
 ![Status: early](https://img.shields.io/badge/status-early-orange)
 
-[Why Cove](#why-cove) · [Install](#install) · [Where it runs](#where-cove-runs) · [Quick start](#quick-start) · [CLI](#cli) · [API](#http-api) · [MCP](#mcp) · [Runo](#cove-and-runo) · [How it works](#how-it-works)
+[Why Cove](#why-cove) · [Install](#install) · [Where it runs](#where-cove-runs) · [Quick start](#quick-start) · [CLI](#cli) · [API](#http-api) · [MCP](#mcp) · [Secrets and egress](#secrets-and-the-allowlist) · [Runo](#cove-and-runo) · [How it works](#how-it-works)
 
 </div>
 
 ---
 
 ```console
+$ curl -fsSL https://raw.githubusercontent.com/deltalark/cove/main/scripts/install.sh | sh
 $ cove up dev --mount ~/code/myapp:/work
 $ cove shell dev --cwd /work
 root@dev:/work# cargo test
 ```
+
+One line installs it on a Mac, a Linux server with KVM, or a cheap VPS without it. Every VM is a real Linux machine that sees only the folders you share, reaches only the hosts you allow, and never holds your API keys.
 
 ## Why Cove
 
@@ -60,9 +63,11 @@ What the script does:
 - **Mac:** installs vfkit with Homebrew if it is missing, and starts `cove serve` at login with a launchd agent.
 - **Linux with KVM:** installs cloud-hypervisor (the official static build) if it is missing, and virtiofsd, iptables and iproute2 from your distribution.
 - **Linux without KVM:** asks to install gVisor (the official release, checksum checked) and uses that. Say no and you get just the CLI, to drive a Cove server elsewhere with `--host`.
-- On Linux, installs a systemd service for `cove serve`; then runs `cove doctor` and pulls the Debian 13 image.
+- On Linux, installs a systemd service for `cove serve`; then runs `cove doctor` and pulls the Debian 13 image. For gVisor that image comes from Docker Hub, and from Google's mirror of it (`mirror.gcr.io`) when Docker Hub's anonymous pull limit refuses a shared VPS address, with every layer checked against its digest either way.
 
 Running it again upgrades in place. Your VMs, images and API key live in `~/.cove` and are left alone. Options go after `sh -s --`, for example `| sh -s -- --no-service`: `--prefix DIR`, `--version TAG`, `--listen ADDR`, `--no-service`, `--no-image`, `--no-link`, `--no-deps`, `--gvisor` / `--no-gvisor`, `--from-source`, `--from-file TARBALL`.
+
+Check the result with `cove doctor`, which lists what each backend needs, what is missing and how to fix it, and which backend `auto` will pick.
 
 **Connecting Runo.** Runo finds the Cove on your Mac by itself. For a server, run `cove key` there, then in Runo add a Cove connection with the server's URL and that key. The API is plain HTTP and listens on `127.0.0.1:7457` by default, so reach it through an SSH tunnel (`ssh -L 7457:127.0.0.1:7457 my-server`, then use `http://127.0.0.1:7457`), or put an HTTPS reverse proxy in front of it before you open it up with `--listen`.
 
@@ -243,6 +248,8 @@ Cove is built to work hand in hand with [Runo](https://github.com/deltalark/runo
 
 **Runo's Cove settings** choose each connection's VM size, its network policy (`full`, or `off` for agents that shouldn't reach the internet) and its idle stop, so VMs on a server stop by themselves once their sessions go quiet. Only the API keys you list reach a VM, and deleting a session deletes its VM.
 
+**Agents keep going without you.** On a Cove server, Runo runs each agent turn as a Cove named process (`cove spawn`) and follows its output. Close your laptop and the turn keeps running in the VM; when Runo opens again it reattaches, replays what you missed and brings the work back.
+
 **Agents use Cove too.** Through `cove mcp`, an agent in Runo can make scratch VMs of its own: to research something without touching the session's worktree, to run code it doesn't trust with the network off, or to hand a heavy build to a bigger machine with `vm_spawn` and check on it with `vm_logs`.
 
 Runo checks `/v1/health` to see which of these a server supports, so an older Cove keeps working for what it can do.
@@ -281,16 +288,25 @@ flowchart LR
 
 ## Roadmap
 
-Cove is early. Here today: the macOS backend, the guest agent, the API, the CLI and the MCP server, with per-VM network policy and idle stop, and the installer.
+Cove is early, but the core is here.
 
-- [x] gVisor backend for Linux without KVM: built and tested end to end, from pulling the image to booting, exec, shared folders, restarts and copies
-- [ ] Linux backend with KVM (cloud-hypervisor): built and covered by unit tests; booting on a KVM host is still to be confirmed with `scripts/smoke-vm.sh`
+**Shipped**
+
+- [x] macOS backend on Apple Silicon (vfkit), the guest agent, the HTTP API, the CLI and the MCP server
+- [x] gVisor backend for Linux without KVM: tested end to end, from pulling the image to booting, exec, shared folders, restarts and copies
+- [x] A Docker Hub mirror fallback, so a first install on a shared VPS address doesn't fail on Docker Hub's pull limit
+- [x] One-line install and upgrade for macOS and Linux, with a launchd agent or a systemd service
+- [x] Per-VM network policy, idle stop and a `/v1/health` features list for clients
 - [x] Secrets kept out of VMs, and an egress allowlist with a log
+- [x] Runo Connections: Cove on your Mac or on a server, by URL and API key, with agent turns that outlive your laptop
+
+**Next**
+
+- [ ] Linux backend with KVM (cloud-hypervisor): built and covered by unit tests; booting on a KVM host is still to be confirmed with `scripts/smoke-vm.sh`
 - [ ] Golden environments: set a project up once and start every VM from it
 - [ ] Checkpoints and forks
 - [ ] HTTPS proxy with a private-by-default URL for every VM
 - [ ] Sharing VMs and previews
-- [ ] Pairing a remote Cove server with Runo
 - [ ] Snapshots and a web dashboard
 
 See [the full plan](docs/plan.md) for details and the security model.
