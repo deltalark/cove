@@ -343,7 +343,7 @@ Cove is early, but the core is here.
 
 **Next**
 
-- [ ] Pause to disk on a Mac (vfkit pauses in memory)
+- [ ] Pause to disk on a Mac (vfkit pauses with the memory kept in RAM)
 - [ ] SSH from any terminal: a gateway with keys and paste-anywhere tokens
 - [ ] Public HTTPS ports on your own domain, with wake on visit
 - [ ] Secrets stored on the server and changeable on a running VM
