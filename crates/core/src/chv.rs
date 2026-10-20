@@ -121,13 +121,27 @@ pub fn virtiofsd_args(mount: &Mount, socket: &Path, root: bool) -> Vec<String> {
     args
 }
 
+/// Whether this cloud-hypervisor wants `image_type=` on its disks. v54 refuses
+/// disks without it, and versions before it refuse the option, so ask its `--help`.
+pub fn wants_image_type(program: &Path) -> bool {
+    static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ANSWER.get_or_init(|| {
+        std::process::Command::new(program)
+            .arg("--help")
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("image_type="))
+    })
+}
+
 pub fn cloud_hypervisor_args(
     record: &VmRecord,
     vm_dir: &Path,
     firmware: &Path,
     net: Option<NetSlot>,
+    image_type: bool,
 ) -> Vec<String> {
     let d = |name: &str| vm_dir.join(name).display().to_string();
+    let raw = if image_type { ",image_type=raw" } else { "" };
     let mut args = vec![
         "--firmware".into(),
         firmware.display().to_string(),
@@ -137,8 +151,8 @@ pub fn cloud_hypervisor_args(
         "--memory".into(),
         format!("size={}M,shared=on", record.spec.memory_mb),
         "--disk".into(),
-        format!("path={}", d("disk.raw")),
-        format!("path={},readonly=on", d("seed.img")),
+        format!("path={}{raw}", d("disk.raw")),
+        format!("path={},readonly=on{raw}", d("seed.img")),
         "--vsock".into(),
         format!("cid=3,socket={}", d("vsock.sock")),
         "--api-socket".into(),
@@ -504,6 +518,7 @@ mod tests {
             Path::new("/vms/a"),
             Path::new("/fw/CLOUDHV.fd"),
             Some(NetSlot(5)),
+            false,
         )
         .join(" ");
         assert!(args.starts_with("--firmware /fw/CLOUDHV.fd --cpus boot=4"));
@@ -520,9 +535,20 @@ mod tests {
     }
 
     #[test]
+    fn newer_versions_name_the_image_type() {
+        let r = record(Network::Off, vec![]);
+        let args =
+            cloud_hypervisor_args(&r, Path::new("/v"), Path::new("/fw"), None, true).join(" ");
+        assert!(args.contains(
+            "--disk path=/v/disk.raw,image_type=raw path=/v/seed.img,readonly=on,image_type=raw"
+        ));
+    }
+
+    #[test]
     fn no_network_no_nic() {
         let r = record(Network::Off, vec![]);
-        let args = cloud_hypervisor_args(&r, Path::new("/v"), Path::new("/fw"), None).join(" ");
+        let args =
+            cloud_hypervisor_args(&r, Path::new("/v"), Path::new("/fw"), None, false).join(" ");
         assert!(!args.contains("--net"));
         assert!(!args.contains("--fs"));
         assert!(args.contains("--vsock"));

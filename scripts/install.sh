@@ -556,15 +556,15 @@ case ":$PATH:" in
 esac
 if [ "$backend_ready" = 1 ]; then
   if [ "$started" = 1 ]; then
-    say "The server runs at $local_url. Try:  cove up dev && cove shell dev"
+    say "The server runs at $local_url. Try:  cove sh"
   else
     say "Start the server with:  cove serve"
   fi
   if [ "$os" = Darwin ]; then
     say "Runo finds this machine's Cove by itself."
   fi
-  say "To use it from Runo on another machine, run \`cove key\` here and add a Cove"
-  say "connection in Runo with this server's URL and that key. The API is plain HTTP on"
+  say "To use it from Runo on another machine, run \`cove pair\` here and add a Cove"
+  say "connection in Runo with this server's URL and the code. The API is plain HTTP on"
   say "$listen: reach it through an SSH tunnel (ssh -L 7457:127.0.0.1:7457 this-server)"
   say "or put an HTTPS reverse proxy in front before opening it to the internet."
 elif [ "$os" = Linux ] && [ ! -e /dev/kvm ]; then

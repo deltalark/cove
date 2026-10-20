@@ -181,12 +181,23 @@ async fn images(State(app): State<App>) -> Json<Vec<image::ImageInfo>> {
     Json(image::list(&app.manager.paths))
 }
 
+#[derive(Deserialize)]
+struct PullQuery {
+    /// The backend to fetch the image for (`gvisor` wants a root filesystem, the
+    /// others a disk). Default: the one `auto` picks.
+    backend: Option<String>,
+}
+
 async fn pull_image(
     State(app): State<App>,
     Path(name): Path<String>,
+    Query(q): Query<PullQuery>,
 ) -> ApiResult<Vec<image::ImageInfo>> {
     // Fetch the form the backend VMs get here boots from.
-    let backend = cove_core::backend::auto().unwrap_or(cove_core::backend::platform_default());
+    let backend = match q.backend.as_deref() {
+        Some(b) => cove_core::backend::resolve(b)?,
+        None => cove_core::backend::auto().unwrap_or(cove_core::backend::platform_default()),
+    };
     image::pull_for(&app.manager.paths, &name, backend).await?;
     Ok(Json(image::list(&app.manager.paths)))
 }

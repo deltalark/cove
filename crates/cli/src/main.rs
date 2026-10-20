@@ -457,7 +457,13 @@ fn put<T: serde::Serialize>(body: &mut serde_json::Value, key: &str, value: Opti
 #[derive(Subcommand)]
 enum ImageCmd {
     Ls,
-    Pull { name: String },
+    Pull {
+        name: String,
+        /// Fetch it for this backend (gvisor needs a root filesystem, the others a
+        /// disk). Default: the one auto picks.
+        #[arg(long)]
+        backend: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -636,7 +642,7 @@ fn print_vms(vms: &[VmStatus]) {
         return;
     }
     println!(
-        "{:<20} {:<9} {:<10} {:>4} {:>8} {:>6} {:<9} {:<10}  MOUNTS",
+        "{:<20} {:<9} {:<18} {:>4} {:>8} {:>6} {:<9} {:<10}  MOUNTS",
         "NAME", "STATE", "IMAGE", "CPU", "MEMORY", "DISK", "NET", "IDLE"
     );
     for vm in vms {
@@ -659,7 +665,7 @@ fn print_vms(vms: &[VmStatus]) {
             None => vm.image.clone(),
         };
         println!(
-            "{:<20} {:<9} {:<10} {:>4} {:>7}M {:>5}G {:<9} {:<10}  {}",
+            "{:<20} {:<9} {:<18} {:>4} {:>7}M {:>5}G {:<9} {:<10}  {}",
             vm.name,
             state,
             if vm.backend == backend::HOST {
@@ -762,10 +768,13 @@ async fn run(cli: Cli) -> Result<i32> {
                 }
             });
         }
-        Cmd::Image(ImageCmd::Pull { name }) => {
+        Cmd::Image(ImageCmd::Pull { name, backend }) => {
             eprintln!("Pulling {name}; this downloads a few hundred MB once.");
-            let images: Vec<image::ImageInfo> =
-                client()?.post(&format!("/images/{name}/pull"), &()).await?;
+            let path = match backend {
+                Some(b) => format!("/images/{name}/pull?backend={}", url_escape(&b)),
+                None => format!("/images/{name}/pull"),
+            };
+            let images: Vec<image::ImageInfo> = client()?.post(&path, &()).await?;
             show(json, &images, || println!("Pulled {name}."));
         }
         Cmd::Sh {

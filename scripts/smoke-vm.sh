@@ -26,7 +26,11 @@ trap cleanup EXIT
 
 echo "== host: $(uname -sm)"
 "$R" doctor || true
-"$R" image ls | grep -q "debian-13.*pulled," || "$R" image pull debian-13
+if [ "${COVE_BACKEND:-auto}" = gvisor ]; then
+  "$R" image ls | grep -q "debian-13.*rootfs" || "$R" image pull debian-13 --backend gvisor
+else
+  "$R" image ls | grep -q "debian-13.*pulled," || "$R" image pull debian-13
+fi
 echo "== boot"
 started=$(date +%s)
 "$R" up "$name" --backend "${COVE_BACKEND:-auto}" --cpus 2 --memory 2048 --mount "$work:/work"

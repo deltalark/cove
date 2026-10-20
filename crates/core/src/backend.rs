@@ -355,9 +355,10 @@ pub fn launch(record: &VmRecord, vm_dir: &Path, opts: &LaunchOptions) -> Result<
                 Network::Off | Network::Allowlist => None,
             };
             let helpers = crate::chv::start_virtiofsd(record, vm_dir, &log)?;
-            let mut cmd = std::process::Command::new(program);
+            let mut cmd = std::process::Command::new(&program);
+            let image_type = crate::chv::wants_image_type(&program);
             cmd.args(crate::chv::cloud_hypervisor_args(
-                record, vm_dir, &firmware, net,
+                record, vm_dir, &firmware, net, image_type,
             ))
             .stdout(log.try_clone()?)
             .stderr(log);
