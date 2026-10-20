@@ -235,9 +235,15 @@ pub fn prepare_rootfs(record: &VmRecord, root: &Path) -> Result<()> {
 /// Copy a root filesystem, keeping owners and modes (and sharing blocks where the
 /// filesystem can).
 pub fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+    // GNU cp shares blocks with --reflink; macOS's (for the dev backend) with -c.
+    let share = if cfg!(target_os = "macos") {
+        "-c"
+    } else {
+        "--reflink=auto"
+    };
     let status = Command::new("cp")
         .arg("-a")
-        .arg("--reflink=auto")
+        .arg(share)
         .arg(from)
         .arg(to)
         .status()
@@ -339,6 +345,7 @@ pub fn launch(
                 .and_then(|p| p.trim().parse::<u32>().ok())
                 .context("runsc wrote no pid")?;
             return Ok(Launch {
+                platform: Some(platform.clone()),
                 pid,
                 guest: GuestAddr::Unix {
                     path: socket(vm_dir),
@@ -346,6 +353,8 @@ pub fn launch(
                 started_at: crate::now(),
                 helpers: vec![],
                 net: net.map(|n| n.0),
+                paused: None,
+                saved: false,
             });
         }
         last_error = format!("runsc couldn't start the sandbox on the {platform} platform");
@@ -358,6 +367,135 @@ pub fn launch(
         "{last_error} (see {})",
         vm_dir.join("backend.log").display()
     )
+}
+
+/// The file whose presence keeps the agent from listening (see `Request::Suspend`),
+/// on the host and inside the sandbox.
+fn marker(vm_dir: &Path) -> (PathBuf, String) {
+    (
+        vm_dir.join("run").join("suspended"),
+        format!("{RUN_IN_SANDBOX}/suspended"),
+    )
+}
+
+/// Write a running sandbox's memory to `state/` and end it (`runsc checkpoint`). The
+/// agent first lets go of its sockets to the host, which gVisor can't save; if the
+/// checkpoint fails anyway, the agent listens again and the sandbox carries on.
+pub async fn save(name: &str, vm_dir: &Path, launch: &Launch) -> Result<()> {
+    let (host_marker, guest_marker) = marker(vm_dir);
+    std::fs::write(&host_marker, b"")?;
+    let undo = || {
+        let _ = std::fs::remove_file(&host_marker);
+    };
+    let asked = tokio::time::timeout(
+        Duration::from_secs(10),
+        launch.guest.call(&cove_proto::Request::Suspend {
+            marker: guest_marker,
+        }),
+    )
+    .await;
+    if !matches!(asked, Ok(Ok(_))) {
+        undo();
+        bail!("the guest agent can't suspend (it may be older than this server)");
+    }
+    let state = crate::chv::state_dir(vm_dir);
+    let _ = std::fs::remove_dir_all(&state);
+    std::fs::create_dir_all(&state)?;
+    let id = container_id(name);
+    let image = format!("--image-path={}", state.display());
+    let mut last = Err(anyhow::anyhow!("not tried"));
+    // The agent's threads close their streams within moments; try again once.
+    for wait in [300, 1500] {
+        tokio::time::sleep(Duration::from_millis(wait)).await;
+        last = runsc_checked(vm_dir, &["checkpoint", &image, &id]);
+        if last.is_ok() {
+            break;
+        }
+    }
+    if let Err(e) = last {
+        let _ = std::fs::remove_dir_all(&state);
+        undo();
+        return Err(e);
+    }
+    runsc_quiet(vm_dir, &["delete", "--force", &id]);
+    Ok(())
+}
+
+/// Start a checkpointed sandbox again where it was (`runsc restore`); returns the
+/// sandbox's new pid. It runs once this returns.
+pub fn restore(
+    record: &VmRecord,
+    vm_dir: &Path,
+    platform: &str,
+    net: Option<NetSlot>,
+) -> Result<u32> {
+    use std::os::unix::process::CommandExt;
+    let id = container_id(&record.spec.name);
+    runsc_quiet(vm_dir, &["delete", "--force", &id]);
+    if let Some(slot) = net {
+        crate::chv::setup_nat()?;
+        setup_netns(slot)?;
+    }
+    let pid_file = vm_dir.join("runsc.pid");
+    let _ = std::fs::remove_file(&pid_file);
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(vm_dir.join("backend.log"))?;
+    let state = crate::chv::state_dir(vm_dir);
+    let ok = Command::new(runsc()?)
+        .args(runsc_flags(vm_dir, platform, record.spec.network))
+        .arg("restore")
+        .arg(format!("--image-path={}", state.display()))
+        .arg("--bundle")
+        .arg(vm_dir.join("bundle"))
+        .arg("--pid-file")
+        .arg(&pid_file)
+        .arg("--detach")
+        .arg(&id)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .process_group(0)
+        .status()
+        .context("running runsc")?
+        .success();
+    let _ = std::fs::remove_file(marker(vm_dir).0);
+    if !ok {
+        runsc_quiet(vm_dir, &["delete", "--force", &id]);
+        bail!("runsc couldn't restore the sandbox (see backend.log)");
+    }
+    std::fs::read_to_string(&pid_file)
+        .ok()
+        .and_then(|p| p.trim().parse::<u32>().ok())
+        .context("runsc wrote no pid")
+}
+
+/// Freeze every process in a sandbox (`runsc pause`); memory stays as it is.
+pub fn pause(name: &str, vm_dir: &Path) -> Result<()> {
+    runsc_checked(vm_dir, &["pause", &container_id(name)])
+}
+
+pub fn resume(name: &str, vm_dir: &Path) -> Result<()> {
+    runsc_checked(vm_dir, &["resume", &container_id(name)])
+}
+
+/// Run a runsc command against this VM's state, with its error on failure.
+fn runsc_checked(vm_dir: &Path, args: &[&str]) -> Result<()> {
+    let out = Command::new(runsc()?)
+        .arg(format!("--root={}", vm_dir.join("runsc").display()))
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .context("running runsc")?;
+    if !out.status.success() {
+        bail!(
+            "runsc {}: {}",
+            args.first().unwrap_or(&""),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// Stop a sandbox: SIGTERM to everything in it, then SIGKILL, then remove it.
@@ -487,6 +625,7 @@ mod tests {
                 idle_stop_minutes: None,
                 allow: Vec::new(),
                 secrets: Vec::new(),
+                ..VmSpec::default()
             },
             created_at: 0,
             instance_id: "x".into(),

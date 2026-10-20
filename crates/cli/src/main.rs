@@ -9,7 +9,7 @@ use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use client::Client;
 use cove_core::manager::EgressReport;
-use cove_core::model::{Mount, Secret, VmSpec};
+use cove_core::model::{Mount, Secret, TimeoutAction};
 use cove_core::paths::Paths;
 use cove_core::{backend, image, Manager, Network, VmStatus};
 use cove_proto::{Command as GuestCommand, Request};
@@ -47,19 +47,38 @@ enum Cmd {
     /// Base images.
     #[command(subcommand)]
     Image(ImageCmd),
-    /// Create and start a VM.
+    /// Create a VM (or reuse one) and open a shell in it: the quickest way in.
+    Sh {
+        /// The VM to use; created if it doesn't exist yet.
+        #[arg(default_value = "dev")]
+        name: String,
+        /// Start a new VM from this snapshot (default: the server's settings).
+        #[arg(long)]
+        snapshot: Option<String>,
+        /// Share a folder into a new VM: HOST:GUEST or HOST:GUEST:ro.
+        #[arg(long = "mount")]
+        mounts: Vec<String>,
+        #[arg(long)]
+        cwd: Option<String>,
+    },
+    /// Create and start a VM. Options left out come from the server's settings
+    /// (`cove settings`), then Cove's defaults (2 CPUs, 4096 MB, 20 GB, debian-13).
     Up {
         name: String,
-        #[arg(long, default_value = "debian-13")]
-        image: String,
-        #[arg(long, default_value_t = 2)]
-        cpus: u32,
+        /// The base image (default: debian-13).
+        #[arg(long, conflicts_with = "snapshot")]
+        image: Option<String>,
+        /// Start from a snapshot instead of an image (`cove snapshot ls`).
+        #[arg(long)]
+        snapshot: Option<String>,
+        #[arg(long)]
+        cpus: Option<u32>,
         /// Memory in MB.
-        #[arg(long, default_value_t = 4096)]
-        memory: u64,
+        #[arg(long)]
+        memory: Option<u64>,
         /// Disk in GB.
-        #[arg(long, default_value_t = 20)]
-        disk: u64,
+        #[arg(long)]
+        disk: Option<u64>,
         /// Share a folder: HOST:GUEST or HOST:GUEST:ro.
         #[arg(long = "mount")]
         mounts: Vec<String>,
@@ -68,26 +87,43 @@ enum Cmd {
         ephemeral: bool,
         #[arg(long = "tag")]
         tags: Vec<String>,
+        /// key=value metadata for finding it later (`cove ls --label key=value`).
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        labels: Vec<String>,
         /// auto (the best this machine has), vfkit, cloud-hypervisor, gvisor or host
         /// (development only).
-        #[arg(long, default_value = "auto")]
-        backend: String,
+        #[arg(long)]
+        backend: Option<String>,
         /// full (NAT to the internet), off (no network device at all) or allowlist
         /// (only the hosts given with --allow, through Cove's proxy).
-        #[arg(long, default_value = "full")]
-        network: Network,
+        #[arg(long)]
+        network: Option<Network>,
         #[command(flatten)]
         egress: EgressArgs,
-        /// Stop the VM after this many minutes with no commands, streams or running
-        /// named processes.
+        /// Pause the VM (memory and processes kept) after this many minutes with no
+        /// commands, streams or running named processes. Using it resumes it.
+        #[arg(long = "auto-pause", value_name = "MINUTES")]
+        auto_pause: Option<u64>,
+        /// Stop the VM instead after this many idle minutes.
         #[arg(long = "idle-stop", value_name = "MINUTES")]
         idle_stop: Option<u64>,
+        /// Pause or delete the VM this long from now: 30m, 2h, 1h30m (1 minute to 24
+        /// hours).
+        #[arg(long, value_name = "DURATION")]
+        timeout: Option<String>,
+        /// What the timeout does: pause or delete.
+        #[arg(long = "on-timeout", default_value = "pause")]
+        on_timeout: TimeoutAction,
         /// Create without starting.
         #[arg(long)]
         no_start: bool,
     },
     /// List VMs.
-    Ls,
+    Ls {
+        /// Only VMs with this label; repeat for more (all must match).
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        labels: Vec<String>,
+    },
     /// Show one VM.
     Show {
         name: String,
@@ -98,6 +134,72 @@ enum Cmd {
     Stop {
         name: String,
     },
+    /// Freeze a running VM: memory and processes are kept, it uses no CPU.
+    #[command(alias = "suspend")]
+    Pause {
+        name: String,
+    },
+    /// Carry on where a paused VM left off.
+    Resume {
+        name: String,
+    },
+    /// Pause or delete a VM this long from now (30m, 2h); 0 clears it.
+    Timeout {
+        name: String,
+        duration: String,
+        /// pause or delete.
+        #[arg(long = "on-timeout", default_value = "pause")]
+        on_timeout: TimeoutAction,
+    },
+    /// Pause a VM once it has been idle this many minutes; 0 turns it off.
+    #[command(name = "auto-pause", alias = "auto-suspend")]
+    AutoPause {
+        name: String,
+        minutes: u64,
+    },
+    /// Set a VM's labels (KEY=VALUE), or remove some with --rm KEY.
+    Label {
+        name: String,
+        #[arg(value_name = "KEY=VALUE")]
+        set: Vec<String>,
+        #[arg(long = "rm", value_name = "KEY")]
+        remove: Vec<String>,
+    },
+    /// Rename a stopped VM.
+    Rename {
+        from: String,
+        to: String,
+    },
+    /// Save VMs and start new ones from them.
+    #[command(subcommand)]
+    Snapshot(SnapshotCmd),
+    /// The server's defaults for new VMs.
+    #[command(subcommand)]
+    Settings(SettingsCmd),
+    /// Print a one-time code that connects Runo or another computer to this server.
+    Pair {
+        /// What to call the key it hands out (the client may name it instead).
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Connect this computer's CLI to a server with a code from `cove pair`.
+    Login {
+        /// The server's URL, such as http://127.0.0.1:7457 through an SSH tunnel.
+        url: String,
+        code: String,
+        /// What to call this computer's key on the server.
+        #[arg(long)]
+        name: Option<String>,
+        /// Print the key (with --json, as `key`) instead of saving it, for apps such
+        /// as Runo that keep it themselves.
+        #[arg(long)]
+        no_save: bool,
+    },
+    /// Forget the server `cove login` saved.
+    Logout,
+    /// Named API keys: one per person or device, each revocable.
+    #[command(subcommand)]
+    Keys(KeysCmd),
     /// Delete a VM and its disk.
     Rm {
         name: String,
@@ -212,21 +314,28 @@ struct Ensure {
     /// With --create: HOST:GUEST or HOST:GUEST:ro.
     #[arg(long = "mount")]
     mounts: Vec<String>,
-    #[arg(long, default_value_t = 2)]
-    cpus: u32,
-    #[arg(long, default_value_t = 4096)]
-    memory: u64,
+    #[arg(long)]
+    cpus: Option<u32>,
+    #[arg(long)]
+    memory: Option<u64>,
     /// With --create: auto, vfkit, cloud-hypervisor, gvisor or host (development only).
-    #[arg(long, env = "COVE_BACKEND", default_value = "auto")]
-    backend: String,
+    #[arg(long, env = "COVE_BACKEND")]
+    backend: Option<String>,
     /// With --create: full, off or allowlist.
-    #[arg(long, default_value = "full")]
-    network: Network,
+    #[arg(long)]
+    network: Option<Network>,
     #[command(flatten)]
     egress: EgressArgs,
     /// With --create: stop the VM after this many idle minutes.
     #[arg(long = "idle-stop", value_name = "MINUTES")]
     idle_stop: Option<u64>,
+    /// With --create: pause the VM after this many idle minutes; using it resumes
+    /// it. Checked before --idle-stop.
+    #[arg(long = "auto-pause", value_name = "MINUTES")]
+    auto_pause: Option<u64>,
+    /// With --create: start from this snapshot.
+    #[arg(skip)]
+    snapshot: Option<String>,
 }
 
 /// Where a new VM may connect, and the secrets Cove adds for it.
@@ -247,9 +356,9 @@ struct EgressArgs {
 
 impl EgressArgs {
     /// `allow` and `secrets` for a create request.
-    fn body(&self, network: Network) -> Result<(Vec<String>, Vec<Secret>)> {
+    fn body(&self, network: Option<Network>) -> Result<(Vec<String>, Vec<Secret>)> {
         let mut allow = self.allow.clone();
-        if network == Network::Allowlist && allow.is_empty() {
+        if network == Some(Network::Allowlist) && allow.is_empty() {
             allow.push("@dev".into());
         }
         let secrets = self
@@ -289,7 +398,8 @@ fn parse_secret(text: &str) -> Result<Secret> {
     })
 }
 
-/// Make sure `name` is running: start it if stopped, create it with `--create`.
+/// Make sure `name` is running: resume it if paused, start it if stopped, create it
+/// with `--create`.
 async fn ensure_running(client: &Client, name: &str, ensure: &Ensure) -> Result<()> {
     let found = client.get::<VmStatus>(&format!("/vms/{name}")).await;
     let state = match &found {
@@ -299,6 +409,13 @@ async fn ensure_running(client: &Client, name: &str, ensure: &Ensure) -> Result<
     };
     match state {
         Some(cove_core::VmState::Running) => return Ok(()),
+        Some(cove_core::VmState::Paused) => {
+            eprintln!("Resuming VM {name}…");
+            client
+                .post::<VmStatus>(&format!("/vms/{name}/resume"), &())
+                .await?;
+            return Ok(());
+        }
         Some(_) => eprintln!("Starting VM {name}…"),
         None => {
             eprintln!("Creating VM {name} (the first boot takes a little longer)…");
@@ -308,18 +425,23 @@ async fn ensure_running(client: &Client, name: &str, ensure: &Ensure) -> Result<
                 .map(|m| parse_mount(m))
                 .collect::<Result<Vec<_>>>()?;
             let (allow, secrets) = ensure.egress.body(ensure.network)?;
-            let body = serde_json::json!({
+            let mut body = serde_json::json!({
                 "name": name,
-                "cpus": ensure.cpus,
-                "memory_mb": ensure.memory,
                 "mounts": mounts,
-                "backend": ensure.backend,
-                "network": ensure.network,
-                "allow": allow,
                 "secrets": secrets,
-                "idle_stop_minutes": ensure.idle_stop,
                 "start": true,
             });
+            // Only what was asked for, so the server's settings fill the rest.
+            put(&mut body, "cpus", ensure.cpus);
+            put(&mut body, "memory_mb", ensure.memory);
+            put(&mut body, "backend", ensure.backend.clone());
+            put(&mut body, "network", ensure.network);
+            put(&mut body, "idle_stop_minutes", ensure.idle_stop);
+            put(&mut body, "auto_pause_minutes", ensure.auto_pause);
+            put(&mut body, "snapshot", ensure.snapshot.clone());
+            if !allow.is_empty() {
+                body["allow"] = serde_json::json!(allow);
+            }
             match client.post::<VmStatus>("/vms", &body).await {
                 Ok(_) => return Ok(()),
                 // Created by someone else in the meantime: just start it.
@@ -334,10 +456,154 @@ async fn ensure_running(client: &Client, name: &str, ensure: &Ensure) -> Result<
     Ok(())
 }
 
+/// Set `key` in a JSON object when there is a value.
+fn put<T: serde::Serialize>(body: &mut serde_json::Value, key: &str, value: Option<T>) {
+    if let Some(v) = value {
+        body[key] = serde_json::json!(v);
+    }
+}
+
 #[derive(Subcommand)]
 enum ImageCmd {
     Ls,
-    Pull { name: String },
+    Pull {
+        name: String,
+        /// Fetch it for this backend (gvisor needs a root filesystem, the others a
+        /// disk). Default: the one auto picks.
+        #[arg(long)]
+        backend: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SnapshotCmd {
+    /// Save a VM as a snapshot. A running VM is frozen while its disk is copied,
+    /// then carries on.
+    Save {
+        vm: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "")]
+        description: String,
+    },
+    /// List snapshots.
+    Ls,
+    /// Delete a snapshot. VMs made from it are not affected.
+    Rm { name: String },
+    /// Build a snapshot by running a setup script in a fresh VM, such as
+    /// scripts/templates/universal.sh.
+    Build {
+        name: String,
+        /// The setup script, run as root with bash.
+        #[arg(long)]
+        script: String,
+        /// The image to start from.
+        #[arg(long, default_value = "debian-13")]
+        image: String,
+        /// Start from another snapshot instead.
+        #[arg(long, conflicts_with = "image")]
+        from: Option<String>,
+        #[arg(long)]
+        backend: Option<String>,
+        #[arg(long)]
+        cpus: Option<u32>,
+        #[arg(long)]
+        memory: Option<u64>,
+        #[arg(long)]
+        disk: Option<u64>,
+        #[arg(long, default_value = "")]
+        description: String,
+        /// Keep the VM it was built in, to look around.
+        #[arg(long)]
+        keep: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SettingsCmd {
+    /// Show the server's defaults for new VMs.
+    Show,
+    /// Change defaults: cpus=4 memory_mb=8192 network=allowlist auto_pause_minutes=30
+    /// snapshot=universal …
+    Set {
+        #[arg(value_name = "KEY=VALUE", required = true)]
+        pairs: Vec<String>,
+    },
+    /// Go back to Cove's own default for these settings.
+    Unset {
+        #[arg(required = true)]
+        keys: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeysCmd {
+    Ls,
+    /// Make a key and print it once.
+    Create {
+        name: String,
+    },
+    /// Revoke a key by id or name.
+    Rm {
+        id: String,
+    },
+}
+
+/// `30m`, `2h`, `1h30m`, `1d`, or a bare number of minutes.
+fn parse_minutes(text: &str) -> Result<u64> {
+    let text = text.trim();
+    if let Ok(m) = text.parse::<u64>() {
+        return Ok(m);
+    }
+    let mut total = 0u64;
+    let mut number = String::new();
+    for c in text.chars() {
+        if c.is_ascii_digit() {
+            number.push(c);
+            continue;
+        }
+        let n: u64 = number
+            .parse()
+            .map_err(|_| anyhow::anyhow!("can't read the duration {text:?} (try 30m or 2h)"))?;
+        number.clear();
+        total += match c {
+            's' => n.div_ceil(60),
+            'm' => n,
+            'h' => n * 60,
+            'd' => n * 24 * 60,
+            _ => bail!("can't read the duration {text:?} (try 30m or 2h)"),
+        };
+    }
+    if !number.is_empty() {
+        bail!("can't read the duration {text:?}: give a unit (30m, 2h)");
+    }
+    Ok(total)
+}
+
+fn parse_labels(pairs: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
+    pairs
+        .iter()
+        .map(|kv| match kv.split_once('=') {
+            Some((k, v)) => Ok((k.to_string(), v.to_string())),
+            None => bail!("labels are KEY=VALUE, got {kv:?}"),
+        })
+        .collect()
+}
+
+/// A settings value from the command line: a number, true/false, a list
+/// (`a,b`) for `allow`, else text.
+fn setting_value(key: &str, value: &str) -> serde_json::Value {
+    if key == "allow" {
+        return serde_json::json!(value
+            .split(',')
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .collect::<Vec<_>>());
+    }
+    if let Ok(n) = value.parse::<u64>() {
+        return serde_json::json!(n);
+    }
+    serde_json::json!(value)
 }
 
 fn main() {
@@ -385,7 +651,7 @@ fn print_vms(vms: &[VmStatus]) {
         return;
     }
     println!(
-        "{:<20} {:<9} {:<10} {:>4} {:>8} {:>6} {:<4} {:>5}  MOUNTS",
+        "{:<20} {:<9} {:<18} {:>4} {:>8} {:>6} {:<9} {:<10}  MOUNTS",
         "NAME", "STATE", "IMAGE", "CPU", "MEMORY", "DISK", "NET", "IDLE"
     );
     for vm in vms {
@@ -398,18 +664,23 @@ fn print_vms(vms: &[VmStatus]) {
             .iter()
             .map(|m| format!("{}:{}", m.host, m.guest))
             .collect();
-        let idle = vm
-            .idle_stop_minutes
-            .map(|m| format!("{m}m"))
-            .unwrap_or_else(|| "-".into());
+        let idle = match (vm.auto_pause_minutes, vm.idle_stop_minutes) {
+            (Some(m), _) => format!("pause {m}m"),
+            (None, Some(m)) => format!("stop {m}m"),
+            (None, None) => "-".into(),
+        };
+        let image = match &vm.snapshot {
+            Some(s) => s.clone(),
+            None => vm.image.clone(),
+        };
         println!(
-            "{:<20} {:<9} {:<10} {:>4} {:>7}M {:>5}G {:<4} {:>5}  {}",
+            "{:<20} {:<9} {:<18} {:>4} {:>7}M {:>5}G {:<9} {:<10}  {}",
             vm.name,
             state,
             if vm.backend == backend::HOST {
                 "(host)"
             } else {
-                &vm.image
+                &image
             },
             vm.cpus,
             vm.memory_mb,
@@ -418,6 +689,20 @@ fn print_vms(vms: &[VmStatus]) {
             idle,
             mounts.join(", ")
         );
+        if let Some(by) = vm.paused_by {
+            let why = match by {
+                cove_core::model::PauseReason::User => "paused; cove resume wakes it",
+                cove_core::model::PauseReason::Idle => "paused while idle; using it wakes it",
+                cove_core::model::PauseReason::Timeout => {
+                    "paused by its timeout; cove resume wakes it"
+                }
+            };
+            if vm.paused_to_disk {
+                println!("  {why} (its memory is on disk, so it uses no RAM)");
+            } else {
+                println!("  {why}");
+            }
+        }
         if let Some(e) = &vm.error {
             println!("  error: {e}");
         }
@@ -496,25 +781,64 @@ async fn run(cli: Cli) -> Result<i32> {
                 }
             });
         }
-        Cmd::Image(ImageCmd::Pull { name }) => {
+        Cmd::Image(ImageCmd::Pull { name, backend }) => {
             eprintln!("Pulling {name}; this downloads a few hundred MB once.");
-            let images: Vec<image::ImageInfo> =
-                client()?.post(&format!("/images/{name}/pull"), &()).await?;
+            let path = match backend {
+                Some(b) => format!("/images/{name}/pull?backend={}", url_escape(&b)),
+                None => format!("/images/{name}/pull"),
+            };
+            let images: Vec<image::ImageInfo> = client()?.post(&path, &()).await?;
             show(json, &images, || println!("Pulled {name}."));
+        }
+        Cmd::Sh {
+            name,
+            snapshot,
+            mounts,
+            cwd,
+        } => {
+            let ensure = Ensure {
+                create: true,
+                mounts,
+                cpus: None,
+                memory: None,
+                backend: std::env::var("COVE_BACKEND").ok(),
+                network: None,
+                egress: EgressArgs {
+                    allow: vec![],
+                    secrets: vec![],
+                },
+                idle_stop: None,
+                auto_pause: None,
+                snapshot,
+            };
+            let client = client()?;
+            ensure_running(&client, &name, &ensure).await?;
+            let command = GuestCommand {
+                cmd: vec!["/bin/bash".into(), "-l".into()],
+                cwd,
+                env: vec![],
+                pty: Some(term::size()),
+            };
+            return term::run(&client, &name, Request::Exec(command)).await;
         }
         Cmd::Up {
             name,
             image,
+            snapshot,
             cpus,
             memory,
             disk,
             mounts,
             ephemeral,
             tags,
+            labels,
             backend,
             network,
             egress,
+            auto_pause,
             idle_stop,
+            timeout,
+            on_timeout,
             no_start,
         } => {
             let mounts = mounts
@@ -522,35 +846,260 @@ async fn run(cli: Cli) -> Result<i32> {
                 .map(|m| parse_mount(m))
                 .collect::<Result<Vec<_>>>()?;
             let (allow, secrets) = egress.body(network)?;
-            let spec = VmSpec {
-                name,
-                image,
-                cpus,
-                memory_mb: memory,
-                disk_gb: disk,
-                mounts,
-                ephemeral,
-                tags,
-                backend,
-                network,
-                idle_stop_minutes: idle_stop,
-                allow,
-                secrets,
-            };
-            let mut body = serde_json::to_value(&spec)?;
-            body["start"] = serde_json::json!(!no_start);
+            let mut body = serde_json::json!({
+                "name": name,
+                "mounts": mounts,
+                "ephemeral": ephemeral,
+                "tags": tags,
+                "labels": parse_labels(&labels)?,
+                "secrets": secrets,
+                "start": !no_start,
+            });
+            // Only what was given, so the server's settings fill the rest.
+            put(&mut body, "image", image);
+            put(&mut body, "snapshot", snapshot);
+            put(&mut body, "cpus", cpus);
+            put(&mut body, "memory_mb", memory);
+            put(&mut body, "disk_gb", disk);
+            put(&mut body, "backend", backend);
+            put(&mut body, "network", network);
+            put(&mut body, "auto_pause_minutes", auto_pause);
+            put(&mut body, "idle_stop_minutes", idle_stop);
+            if !allow.is_empty() {
+                body["allow"] = serde_json::json!(allow);
+            }
+            if let Some(t) = timeout {
+                body["timeout_minutes"] = serde_json::json!(parse_minutes(&t)?);
+                body["on_timeout"] = serde_json::json!(on_timeout);
+            }
             if !no_start {
-                eprintln!(
-                    "Starting {} (the first boot takes a little longer)…",
-                    spec.name
-                );
+                eprintln!("Starting {name} (the first boot takes a little longer)…");
             }
             let vm: VmStatus = client()?.post("/vms", &body).await?;
             show(json, &vm, || print_vms(std::slice::from_ref(&vm)));
         }
-        Cmd::Ls => {
-            let vms: Vec<VmStatus> = client()?.get("/vms").await?;
+        Cmd::Ls { labels } => {
+            let query: Vec<String> = labels
+                .iter()
+                .map(|l| format!("label={}", url_escape(l)))
+                .collect();
+            let path = if query.is_empty() {
+                "/vms".to_string()
+            } else {
+                format!("/vms?{}", query.join("&"))
+            };
+            let vms: Vec<VmStatus> = client()?.get(&path).await?;
             show(json, &vms, || print_vms(&vms));
+        }
+        Cmd::Pause { name } => {
+            let vm: VmStatus = client()?.post(&format!("/vms/{name}/pause"), &()).await?;
+            show(json, &vm, || print_vms(std::slice::from_ref(&vm)));
+        }
+        Cmd::Resume { name } => {
+            let vm: VmStatus = client()?.post(&format!("/vms/{name}/resume"), &()).await?;
+            show(json, &vm, || print_vms(std::slice::from_ref(&vm)));
+        }
+        Cmd::Timeout {
+            name,
+            duration,
+            on_timeout,
+        } => {
+            let minutes = parse_minutes(&duration)?;
+            let timeout = if minutes == 0 {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!({ "minutes": minutes, "action": on_timeout })
+            };
+            let vm: VmStatus = client()?
+                .patch(
+                    &format!("/vms/{name}"),
+                    &serde_json::json!({ "timeout": timeout }),
+                )
+                .await?;
+            show(json, &vm, || match vm.timeout {
+                Some(t) => println!(
+                    "{name} will {} in {} minutes.",
+                    match t.action {
+                        TimeoutAction::Pause => "pause",
+                        TimeoutAction::Delete => "be deleted",
+                    },
+                    t.at.saturating_sub(cove_core::now()).div_ceil(60)
+                ),
+                None => println!("{name} has no timeout."),
+            });
+        }
+        Cmd::AutoPause { name, minutes } => {
+            let value = if minutes == 0 {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(minutes)
+            };
+            let vm: VmStatus = client()?
+                .patch(
+                    &format!("/vms/{name}"),
+                    &serde_json::json!({ "auto_pause_minutes": value }),
+                )
+                .await?;
+            show(json, &vm, || print_vms(std::slice::from_ref(&vm)));
+        }
+        Cmd::Label { name, set, remove } => {
+            let client = client()?;
+            let vm: VmStatus = client.get(&format!("/vms/{name}")).await?;
+            let mut labels = vm.labels;
+            labels.extend(parse_labels(&set)?);
+            for k in &remove {
+                labels.remove(k);
+            }
+            let vm: VmStatus = client
+                .patch(
+                    &format!("/vms/{name}"),
+                    &serde_json::json!({ "labels": labels }),
+                )
+                .await?;
+            show(json, &vm, || {
+                for (k, v) in &vm.labels {
+                    println!("{k}={v}");
+                }
+            });
+        }
+        Cmd::Rename { from, to } => {
+            let vm: VmStatus = client()?
+                .post(
+                    &format!("/vms/{from}/rename"),
+                    &serde_json::json!({ "to": to }),
+                )
+                .await?;
+            show(json, &vm, || print_vms(std::slice::from_ref(&vm)));
+        }
+        Cmd::Snapshot(cmd) => return snapshot_cmd(&client()?, json, cmd).await,
+        Cmd::Settings(cmd) => {
+            let client = client()?;
+            let mut settings: serde_json::Value = client.get("/settings").await?;
+            match cmd {
+                SettingsCmd::Show => {}
+                SettingsCmd::Set { pairs } => {
+                    for kv in &pairs {
+                        let Some((k, v)) = kv.split_once('=') else {
+                            bail!("settings are KEY=VALUE, got {kv:?}");
+                        };
+                        settings[k] = setting_value(k, v);
+                    }
+                    settings = client.put("/settings", &settings).await?;
+                }
+                SettingsCmd::Unset { keys } => {
+                    if let Some(obj) = settings.as_object_mut() {
+                        for k in &keys {
+                            obj.remove(k);
+                        }
+                    }
+                    settings = client.put("/settings", &settings).await?;
+                }
+            }
+            show(json, &settings, || {
+                let obj = settings.as_object().cloned().unwrap_or_default();
+                if obj.is_empty() {
+                    println!(
+                        "No settings: new VMs get Cove's defaults \
+                         (2 CPUs, 4096 MB, 20 GB, debian-13, full network)."
+                    );
+                }
+                for (k, v) in obj {
+                    println!("{k} = {v}");
+                }
+            });
+        }
+        Cmd::Pair { name } => {
+            let client = client()?;
+            let v: serde_json::Value = client
+                .post("/pair/codes", &serde_json::json!({ "name": name }))
+                .await?;
+            show(json, &v, || {
+                let code = v["code"].as_str().unwrap_or("");
+                println!("Pairing code: {code}  (works once, for 10 minutes)");
+                println!();
+                println!("In Runo: add a Cove connection with this server's URL and the code.");
+                println!("From another computer: cove login <this server's URL> {code}");
+                println!("This server listens on {}.", client.url);
+            });
+        }
+        Cmd::Login {
+            url,
+            code,
+            name,
+            no_save,
+        } => {
+            let url = client::server_url(Some(url));
+            let name = name.unwrap_or_else(|| {
+                format!(
+                    "cli on {}",
+                    hostname().unwrap_or_else(|| "a computer".into())
+                )
+            });
+            let v = client::pair(&url, &code, &name).await?;
+            let key = v["key"].as_str().unwrap_or_default().to_string();
+            if no_save {
+                let out =
+                    serde_json::json!({ "url": url, "name": v["name"], "id": v["id"], "key": key });
+                show(json, &out, || println!("{key}"));
+                return Ok(0);
+            }
+            client::save_login(&Paths::from_env(), &url, &key)?;
+            let name = v["name"].as_str().unwrap_or("").to_string();
+            show(
+                json,
+                &serde_json::json!({ "url": url, "name": name }),
+                || {
+                    println!(
+                        "Logged in to {url} as \"{name}\". cove now talks to this server; \
+                     cove logout undoes that."
+                    );
+                },
+            );
+        }
+        Cmd::Logout => {
+            let path = Paths::from_env().login_file();
+            if std::fs::remove_file(&path).is_ok() {
+                println!(
+                    "Logged out. The key stays valid on the server until cove keys rm \
+                     removes it there."
+                );
+            } else {
+                println!("Not logged in.");
+            }
+        }
+        Cmd::Keys(cmd) => {
+            let client = client()?;
+            match cmd {
+                KeysCmd::Ls => {
+                    let keys: Vec<serde_json::Value> = client.get("/keys").await?;
+                    show(json, &keys, || {
+                        if keys.is_empty() {
+                            println!(
+                                "No named keys. Make one with cove keys create NAME or cove pair."
+                            );
+                        }
+                        for k in &keys {
+                            println!(
+                                "{:<16} {}",
+                                k["id"].as_str().unwrap_or(""),
+                                k["name"].as_str().unwrap_or("")
+                            );
+                        }
+                    });
+                }
+                KeysCmd::Create { name } => {
+                    let v: serde_json::Value = client
+                        .post("/keys", &serde_json::json!({ "name": name }))
+                        .await?;
+                    show(json, &v, || println!("{}", v["key"].as_str().unwrap_or("")));
+                }
+                KeysCmd::Rm { id } => {
+                    let v: serde_json::Value = client.delete(&format!("/keys/{id}")).await?;
+                    show(json, &v, || {
+                        println!("Removed {}.", v["name"].as_str().unwrap_or(&id))
+                    });
+                }
+            }
         }
         Cmd::Show { name } => {
             let vm: VmStatus = client()?.get(&format!("/vms/{name}")).await?;
@@ -736,6 +1285,153 @@ async fn run(cli: Cli) -> Result<i32> {
         Cmd::Version => version(json, host).await,
     }
     Ok(0)
+}
+
+async fn snapshot_cmd(client: &Client, json: bool, cmd: SnapshotCmd) -> Result<i32> {
+    use cove_core::snapshot::SnapshotInfo;
+    match cmd {
+        SnapshotCmd::Save {
+            vm,
+            name,
+            description,
+        } => {
+            eprintln!("Saving {vm} as {name}…");
+            let snap: SnapshotInfo = client
+                .post(
+                    &format!("/vms/{vm}/snapshots"),
+                    &serde_json::json!({ "name": name, "description": description }),
+                )
+                .await?;
+            show(json, &snap, || print_snapshots(std::slice::from_ref(&snap)));
+        }
+        SnapshotCmd::Ls => {
+            let snaps: Vec<SnapshotInfo> = client.get("/snapshots").await?;
+            show(json, &snaps, || print_snapshots(&snaps));
+        }
+        SnapshotCmd::Rm { name } => {
+            let v: serde_json::Value = client.delete(&format!("/snapshots/{name}")).await?;
+            show(json, &v, || println!("Deleted snapshot {name}."));
+        }
+        SnapshotCmd::Build {
+            name,
+            script,
+            image,
+            from,
+            backend,
+            cpus,
+            memory,
+            disk,
+            description,
+            keep,
+        } => {
+            let script_text =
+                std::fs::read(&script).map_err(|e| anyhow::anyhow!("reading {script}: {e}"))?;
+            let vm = format!("build-{}", cove_core::random_hex(3));
+            let mut body = serde_json::json!({ "name": vm, "network": "full", "start": true });
+            match &from {
+                Some(s) => body["snapshot"] = serde_json::json!(s),
+                None => body["image"] = serde_json::json!(image),
+            }
+            put(&mut body, "backend", backend);
+            put(&mut body, "cpus", cpus);
+            put(&mut body, "memory_mb", memory);
+            put(&mut body, "disk_gb", disk);
+            eprintln!("Starting {vm} to build {name}…");
+            let _: VmStatus = client.post("/vms", &body).await?;
+            let result = async {
+                client
+                    .write_file(&vm, "/root/cove-setup.sh", script_text, Some(0o755))
+                    .await?;
+                eprintln!("Running {script}…");
+                let code = term::run(
+                    client,
+                    &vm,
+                    Request::Exec(GuestCommand {
+                        cmd: vec!["bash".into(), "-l".into(), "/root/cove-setup.sh".into()],
+                        cwd: Some("/root".into()),
+                        env: vec![],
+                        pty: None,
+                    }),
+                )
+                .await?;
+                if code != 0 {
+                    bail!("{script} exited with {code}");
+                }
+                let _: serde_json::Value = client
+                    .post(
+                        &format!("/vms/{vm}/exec"),
+                        &serde_json::json!({ "cmd": ["rm", "-f", "/root/cove-setup.sh"] }),
+                    )
+                    .await?;
+                eprintln!("Stopping {vm} and saving it as {name}…");
+                let _: VmStatus = client.post(&format!("/vms/{vm}/stop"), &()).await?;
+                let snap: SnapshotInfo = client
+                    .post(
+                        &format!("/vms/{vm}/snapshots"),
+                        &serde_json::json!({ "name": name, "description": description }),
+                    )
+                    .await?;
+                Ok(snap)
+            }
+            .await;
+            if keep {
+                eprintln!("Kept {vm}.");
+            } else {
+                let _ = client
+                    .delete::<serde_json::Value>(&format!("/vms/{vm}"))
+                    .await;
+            }
+            let snap = result?;
+            show(json, &snap, || print_snapshots(std::slice::from_ref(&snap)));
+        }
+    }
+    Ok(0)
+}
+
+fn print_snapshots(snaps: &[cove_core::snapshot::SnapshotInfo]) {
+    if snaps.is_empty() {
+        println!("No snapshots. Save one with: cove snapshot save <vm> --name <name>");
+        return;
+    }
+    println!(
+        "{:<20} {:<7} {:<10} {:>8}  {:<16} DESCRIPTION",
+        "NAME", "KIND", "IMAGE", "SIZE", "FROM"
+    );
+    for s in snaps {
+        println!(
+            "{:<20} {:<7} {:<10} {:>7}M  {:<16} {}",
+            s.name,
+            serde_json::to_value(s.kind)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default(),
+            s.image,
+            s.size >> 20,
+            s.source_vm,
+            s.description
+        );
+    }
+}
+
+/// Escape a query value (labels can hold `&`, spaces and `=`).
+fn url_escape(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+fn hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0)?;
+    Some(String::from_utf8_lossy(&buf[..end]).into_owned())
 }
 
 /// Ask the server what it is and can do. Needs no API key; when the server can't be

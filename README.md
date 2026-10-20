@@ -14,17 +14,19 @@ driven from a CLI, an HTTP API or MCP.
 ![Linux · KVM or gVisor](https://img.shields.io/badge/Linux-KVM%20or%20gVisor-lightgrey?logo=linux&logoColor=white)
 ![Status: early](https://img.shields.io/badge/status-early-orange)
 
-[Why Cove](#why-cove) · [Install](#install) · [Where it runs](#where-cove-runs) · [Quick start](#quick-start) · [CLI](#cli) · [API](#http-api) · [MCP](#mcp) · [Runo](#cove-and-runo) · [How it works](#how-it-works)
+[Why Cove](#why-cove) · [Install](#install) · [Where it runs](#where-cove-runs) · [Quick start](#quick-start) · [CLI](#cli) · [API](#http-api) · [MCP](#mcp) · [Secrets and egress](#secrets-and-the-allowlist) · [Runo](#cove-and-runo) · [How it works](#how-it-works)
 
 </div>
 
 ---
 
 ```console
-$ cove up dev --mount ~/code/myapp:/work
-$ cove shell dev --cwd /work
-root@dev:/work# cargo test
+$ curl -fsSL https://raw.githubusercontent.com/deltalark/cove/main/scripts/install.sh | sh
+$ cove sh
+root@dev:~# cargo test
 ```
+
+One line installs it on a Mac, a Linux server with KVM, or a cheap VPS without it. Every VM is a real Linux machine that sees only the folders you share, reaches only the hosts you allow, and never holds your API keys.
 
 ## Why Cove
 
@@ -38,7 +40,9 @@ Coding agents are most useful when you let them run commands freely, and most da
 - **Real isolation.** A VM sees only the folders you share. Commands an agent runs there can't touch your home folder, keychain or SSH keys. Turn its network off entirely for code you don't trust.
 - **Keys never enter the VM.** Give a VM your API keys and tokens as secrets: inside, it sees only placeholders, and Cove's proxy adds the real values to HTTPS requests for the hosts each secret belongs to. An agent can't leak what it never had.
 - **Only the hosts you allow.** With `--network allowlist` a VM has no network device at all and reaches only the hosts on its list, through Cove's proxy. Every connection it tries is logged, so you can see what an agent reached and what was blocked.
-- **Stops when you're done.** Give a VM an idle timer and it stops by itself once nothing has used it for that long, so forgotten agent VMs don't hold on to memory.
+- **Pause, resume, and pause by itself.** `cove pause` freezes a VM with its memory and running processes kept, and `cove resume` carries on where it left off. On Linux the memory goes to disk, so a paused VM uses no RAM at all, and pausing or resuming takes about a second (cloud-hypervisor) or less (gVisor). A VM whose shared folders are in use when it pauses keeps its memory in RAM instead. With `--auto-pause` a VM pauses once it has been idle for a while, and the next command, stream or visit to a forwarded port wakes it. Timeouts pause or delete a VM at a set time.
+- **Snapshots.** Save a VM, even while it runs, and start new VMs from it: set a project up once (`cove snapshot build`) and every VM after that starts ready.
+- **Easy to connect.** `cove pair` prints a one-time code that Runo or another computer trades for a key of its own, and `/v1/settings` holds the server's defaults for new VMs, so Runo can show and change them.
 
 ## Install
 
@@ -60,11 +64,13 @@ What the script does:
 - **Mac:** installs vfkit with Homebrew if it is missing, and starts `cove serve` at login with a launchd agent.
 - **Linux with KVM:** installs cloud-hypervisor (the official static build) if it is missing, and virtiofsd, iptables and iproute2 from your distribution.
 - **Linux without KVM:** asks to install gVisor (the official release, checksum checked) and uses that. Say no and you get just the CLI, to drive a Cove server elsewhere with `--host`.
-- On Linux, installs a systemd service for `cove serve`; then runs `cove doctor` and pulls the Debian 13 image.
+- On Linux, installs a systemd service for `cove serve`; then runs `cove doctor` and pulls the Debian 13 image. For gVisor that image comes from Docker Hub, and from Google's mirror of it (`mirror.gcr.io`) when Docker Hub's anonymous pull limit refuses a shared VPS address, with every layer checked against its digest either way.
 
 Running it again upgrades in place. Your VMs, images and API key live in `~/.cove` and are left alone. Options go after `sh -s --`, for example `| sh -s -- --no-service`: `--prefix DIR`, `--version TAG`, `--listen ADDR`, `--no-service`, `--no-image`, `--no-link`, `--no-deps`, `--gvisor` / `--no-gvisor`, `--from-source`, `--from-file TARBALL`.
 
-**Connecting Runo.** Runo finds the Cove on your Mac by itself. For a server, run `cove key` there, then in Runo add a Cove connection with the server's URL and that key. The API is plain HTTP and listens on `127.0.0.1:7457` by default, so reach it through an SSH tunnel (`ssh -L 7457:127.0.0.1:7457 my-server`, then use `http://127.0.0.1:7457`), or put an HTTPS reverse proxy in front of it before you open it up with `--listen`.
+Check the result with `cove doctor`, which lists what each backend needs, what is missing and how to fix it, and which backend `auto` will pick.
+
+**Connecting Runo.** Runo finds the Cove on your Mac by itself. For a server, run `cove pair` there and give Runo the server's URL and the one-time code it prints; Runo gets a key of its own, which `cove keys rm` revokes (the server's own key from `cove key` works too). Another computer's CLI connects the same way, with `cove login <url> <code>`. The API is plain HTTP and listens on `127.0.0.1:7457` by default, so reach it through an SSH tunnel (`ssh -L 7457:127.0.0.1:7457 my-server`, then use `http://127.0.0.1:7457`), or put an HTTPS reverse proxy in front of it before you open it up with `--listen`.
 
 **Uninstall** with `install.sh --uninstall` (`curl … | sh -s -- --uninstall`). It stops the service and removes the binaries, and keeps `~/.cove`; add `--purge` to stop every VM and delete `~/.cove` too.
 
@@ -86,8 +92,17 @@ With Cove installed and `cove serve` running (the installer starts it):
 
 ```sh
 cove doctor                                  # what works on this machine
-cove up dev --mount ~/code/myapp:/work       # create and start a VM
-cove shell dev --cwd /work                   # a root shell inside it
+cove sh                                      # a shell in a VM called dev, made if needed
+cove up app --mount ~/code/myapp:/work       # or create one with options
+cove shell app --cwd /work
+```
+
+Set up a project once, then start every VM from it:
+
+```sh
+cove snapshot build universal --script scripts/templates/universal.sh
+cove settings set snapshot=universal auto_pause_minutes=30
+cove sh agent-1        # Docker, Node, Python, Go, Rust, gh, Claude Code and Codex are already there
 ```
 
 Want to check a machine end to end? `scripts/smoke-vm.sh` boots a VM and tests exec, shared folders, networking, ports, restarts, copies and `--network off`, on any backend.
@@ -100,10 +115,21 @@ Want to check a machine end to end? `scripts/smoke-vm.sh` boots a VM and tests e
 | `cove doctor` | Check the host setup |
 | `cove key` | Print the API key |
 | `cove image ls` · `cove image pull <image>` | List and download base images |
+| `cove sh [name]` | Open a shell in `name` (default `dev`), creating, starting or resuming it as needed |
 | `cove up <name> [options]` | Create and start a VM (options below) |
-| `cove ls` · `cove show <name>` | List VMs, or show one |
+| `cove ls [--label K=V]` · `cove show <name>` | List VMs (only those with every label given), or show one |
 | `cove start <name>` · `cove stop <name>` · `cove rm <name>` | Start, stop or delete a VM |
+| `cove pause <name>` · `cove resume <name>` | Freeze a VM with its memory and processes kept, and carry on |
+| `cove auto-pause <name> <minutes>` | Pause it once idle that long; `0` turns it off |
+| `cove timeout <name> <30m\|2h\|0> [--on-timeout pause\|delete]` | Pause or delete it that long from now, once; `0` clears it |
+| `cove label <name> K=V... [--rm K]` | Set or remove labels |
+| `cove rename <from> <to>` | Rename a stopped VM |
 | `cove copy <from> <to>` | Clone a VM |
+| `cove snapshot save <vm> --name N` · `cove snapshot ls` · `cove snapshot rm N` | Save a VM (while it runs, too), list and delete snapshots |
+| `cove snapshot build N --script FILE` | Run a setup script in a fresh VM and save the result as a snapshot |
+| `cove settings show` · `set K=V...` · `unset K...` | The server's defaults for new VMs |
+| `cove pair` · `cove login <url> <code>` · `cove logout` | Connect Runo or another computer with a one-time code |
+| `cove keys ls` · `create <name>` · `rm <id>` | Named API keys, one per person or device |
 | `cove exec <name> [-t] [--cwd DIR] [-e K=V]... -- <command...>` | Run a command and wait for it |
 | `cove shell <name> [--cwd DIR]` | Open an interactive shell |
 | `cove spawn <name> <proc> [-t] [-a] -- <command...>` | Start a named background process |
@@ -120,6 +146,7 @@ Want to check a machine end to end? `scripts/smoke-vm.sh` boots a VM and tests e
 
 | Option | Default | What it does |
 | --- | --- | --- |
+| `--snapshot NAME` | | Start from a snapshot instead of the base image |
 | `--cpus N` | `2` | Virtual CPUs |
 | `--memory MB` | `4096` | Memory |
 | `--disk GB` | `20` | Disk size |
@@ -128,11 +155,16 @@ Want to check a machine end to end? `scripts/smoke-vm.sh` boots a VM and tests e
 | `--network full\|off\|allowlist` | `full` | `full` is NAT to your network and the internet. `off` gives the VM no network device at all (a gVisor sandbox gets loopback only); Cove still reaches it over its own channel. `allowlist` has no network device either, and reaches only the `--allow` hosts through Cove's proxy (see [Secrets and the allowlist](#secrets-and-the-allowlist)) |
 | `--allow RULE` | `@dev` with `allowlist` | A host the VM may reach: `example.com`, `*.example.com` (its subdomains), `*`, or a preset: `@dev` (git hosts, package registries, Debian mirrors and model APIs) or `@agents` (model APIs and their sign-in hosts). Repeat for more |
 | `--secret NAME[@HOSTS]` | | Take `NAME` from your environment and keep it out of the VM; see below. Repeat for more |
-| `--idle-stop MINUTES` | off | Stop the VM after this many minutes with no commands, open streams, forwarded connections or running named processes |
+| `--auto-pause MINUTES` | off | Pause the VM after this many minutes with no commands, open streams, forwarded connections or running named processes. Using it again resumes it |
+| `--idle-stop MINUTES` | off | Stop it instead (used when there's no auto-pause) |
+| `--timeout DURATION` | | Pause it (or delete it, with `--on-timeout delete`) this long from now: `30m`, `2h`, up to `24h` |
+| `--label KEY=VALUE` | | Metadata to find it by later; repeat for more (up to 32) |
 | `--ephemeral` | | Delete the VM when it stops |
 | `--tag T` | | Free-form labels; repeat for more |
 
-`cove exec` and `cove shell` start a stopped VM by themselves. With `--create` they also create a missing one, taking `--mount`, `--cpus`, `--memory`, `--backend`, `--network` and `--idle-stop` as above. `cove ls` shows each VM's network policy and idle timer.
+Options left out come from the server's settings (`cove settings`), then the defaults above.
+
+`cove exec` and `cove shell` start a stopped VM, or resume a paused one, by themselves. With `--create` they also create a missing one, taking `--mount`, `--cpus`, `--memory`, `--backend`, `--network` and `--idle-stop` as above. `cove ls` shows each VM's network policy and idle timer.
 
 `cove exec` passes stdin through byte for byte and closes the command's stdin when yours ends, so `echo hi | cove exec dev -- cat` prints `hi`, and binary protocols such as `git upload-pack` run through it unchanged. Output waits for a slow reader instead of being dropped.
 
@@ -140,16 +172,22 @@ Add `--json` to any command for machine-readable output, and `--host URL` to tal
 
 ## HTTP API
 
-Every request carries `Authorization: Bearer <key>`. The key is created on first start in `~/.cove/api-key`, and `cove key` prints it.
+Every request carries `Authorization: Bearer <key>`: the server's own key, created on first start in `~/.cove/api-key` (`cove key` prints it), or a named key from `cove keys create` or pairing. Named keys are stored as hashes and can be revoked one by one.
 
 | Method | Path | Notes |
 | --- | --- | --- |
 | `GET` | `/v1/health` | No auth. `ok, version, protocol, backend, features` |
 | `GET` | `/v1/images` | |
 | `POST` | `/v1/images/{name}/pull` | |
-| `GET` `POST` | `/v1/vms` | POST takes `name, image, cpus, memory_mb, disk_gb, mounts, ephemeral, tags, backend, network, allow, secrets, idle_stop_minutes, start`. `secrets` is a list of `{name, value, hosts}`; responses list only their names and hosts |
-| `GET` `DELETE` | `/v1/vms/{name}` | |
-| `POST` | `/v1/vms/{name}/start`, `/stop`, `/copy` | |
+| `GET` `POST` | `/v1/vms` | POST takes `name, image, snapshot, cpus, memory_mb, disk_gb, mounts, ephemeral, tags, labels, backend, network, allow, secrets, auto_pause_minutes, idle_stop_minutes, timeout_minutes, on_timeout, start`; what it leaves out comes from `/v1/settings`. GET takes `?label=key=value`, repeated. `secrets` is a list of `{name, value, hosts}`; responses list only their names and hosts |
+| `GET` `DELETE` `PATCH` | `/v1/vms/{name}` | PATCH takes any of `labels` (replaces them), `auto_pause_minutes`, `idle_stop_minutes` and `timeout` (`{minutes, action}`); `null` clears a timer |
+| `POST` | `/v1/vms/{name}/start`, `/stop`, `/pause`, `/resume`, `/copy`, `/rename` | `copy` and `rename` take `{"to": ...}` |
+| `POST` | `/v1/vms/{name}/snapshots` | `{name, description}`: save the VM as a snapshot |
+| `GET` `DELETE` | `/v1/snapshots`, `/v1/snapshots/{name}` | |
+| `GET` `PUT` | `/v1/settings` | Defaults for new VMs: `cpus, memory_mb, disk_gb, backend, network, allow, auto_pause_minutes, idle_stop_minutes, snapshot`. PUT replaces them all |
+| `GET` `POST` | `/v1/keys` | POST `{name}` returns a new key once; `DELETE /v1/keys/{id}` revokes one |
+| `POST` | `/v1/pair/codes` | A one-time code (`{code, expires_at}`), good for 10 minutes |
+| `POST` | `/v1/pair` | No auth. `{code, name}` returns `{id, name, key, server}`, where `server` is `/v1/health`. Ten wrong codes in a row lock pairing for 10 minutes |
 | `POST` | `/v1/vms/{name}/exec` | Runs to completion and returns `code, stdout, stderr` |
 | `GET` (WebSocket) | `/v1/vms/{name}/stream` | First message is an `exec`, `spawn` or `attach` request; then frames out, input in |
 | `GET` | `/v1/vms/{name}/procs` | |
@@ -162,6 +200,8 @@ Every request carries `Authorization: Bearer <key>`. The key is created on first
 
 The stream's frames and requests are the types in [`crates/proto`](crates/proto/src/lib.rs).
 
+A VM's `state` is `stopped`, `starting`, `running`, `stopping` or `paused`. A paused one has `paused_to_disk: true` when its memory was written to disk (cloud-hypervisor and gVisor; it then holds no RAM, and survives a server restart), and says why in `paused_by`: `user`, `idle` (the next request resumes it) or `timeout`. Requests to a VM paused by a person or a timeout get a 409 until it is resumed.
+
 A VM's `backend` is `"auto"` (the default) or a backend's name, `network` is `"full"` (the default), `"off"` or `"allowlist"`, and `idle_stop_minutes` is a whole number of minutes, or left out for no timer. All three come back in every VM's status, `backend` as the one it got.
 
 `/v1/health` tells a client what the server can do before it relies on it:
@@ -169,7 +209,8 @@ A VM's `backend` is `"auto"` (the default) or a backend's name, `network` is `"f
 ```json
 { "ok": true, "version": "0.1.0", "protocol": 1, "backend": "gvisor",
   "features": ["network", "idle-stop", "spawn", "attach", "forward", "copy", "files", "stdin-eof",
-               "egress", "backend:gvisor"] }
+               "egress", "pause", "auto-pause", "timeout", "labels", "rename", "snapshots",
+               "settings", "keys", "pair", "backend:gvisor"] }
 ```
 
 `backend` is what `auto` picks (or `null` when nothing can run VMs), and each `backend:<name>` feature is a backend that works on this server. Features are only ever added, so check for the one you need rather than comparing versions.
@@ -190,7 +231,7 @@ Give any MCP-capable agent its own machines:
 | Tool | What it does |
 | --- | --- |
 | `vm_list` | List VMs |
-| `vm_create` | Create and start a VM: `name`, and optionally `cpus`, `memory_mb`, `ephemeral`, `network` (`full`, `off` or `allowlist`), `allow` and `idle_stop_minutes` |
+| `vm_create` | Create and start a VM: `name`, and optionally `cpus`, `memory_mb`, `ephemeral`, `network` (`full`, `off` or `allowlist`), `allow`, `idle_stop_minutes`, `auto_pause_minutes`, `snapshot` and `timeout_minutes` (deletes it then) |
 | `vm_egress` | What a VM may reach, its secrets' names, and the hosts it recently reached or was refused |
 | `vm_exec` | Run a command and wait for it: `name`, `command`, `cwd` |
 | `vm_spawn` | Start a named background process that keeps running: `name`, `proc`, `command`, `cwd` |
@@ -199,6 +240,8 @@ Give any MCP-capable agent its own machines:
 | `vm_read_file` · `vm_write_file` | Read and write files |
 | `vm_share_port` | Forward a port to the host |
 | `vm_stop` · `vm_start` | Stop a VM, keeping its disk, or start it again |
+| `vm_pause` · `vm_resume` | Freeze a VM with its memory kept, and carry on |
+| `vm_snapshot_save` · `vm_snapshot_list` | Save a VM as a snapshot, and list them |
 | `vm_copy` | Copy a stopped VM to a new name: `name`, `to` |
 | `vm_destroy` | Delete a VM |
 
@@ -243,6 +286,8 @@ Cove is built to work hand in hand with [Runo](https://github.com/deltalark/runo
 
 **Runo's Cove settings** choose each connection's VM size, its network policy (`full`, or `off` for agents that shouldn't reach the internet) and its idle stop, so VMs on a server stop by themselves once their sessions go quiet. Only the API keys you list reach a VM, and deleting a session deletes its VM.
 
+**Agents keep going without you.** On a Cove server, Runo runs each agent turn as a Cove named process (`cove spawn`) and follows its output. Close your laptop and the turn keeps running in the VM; when Runo opens again it reattaches, replays what you missed and brings the work back.
+
 **Agents use Cove too.** Through `cove mcp`, an agent in Runo can make scratch VMs of its own: to research something without touching the session's worktree, to run code it doesn't trust with the network off, or to hand a heavy build to a bigger machine with `vm_spawn` and check on it with `vm_logs`.
 
 Runo checks `/v1/health` to see which of these a server supports, so an older Cove keeps working for what it can do.
@@ -281,17 +326,29 @@ flowchart LR
 
 ## Roadmap
 
-Cove is early. Here today: the macOS backend, the guest agent, the API, the CLI and the MCP server, with per-VM network policy and idle stop, and the installer.
+Cove is early, but the core is here.
 
-- [x] gVisor backend for Linux without KVM: built and tested end to end, from pulling the image to booting, exec, shared folders, restarts and copies
-- [ ] Linux backend with KVM (cloud-hypervisor): built and covered by unit tests; booting on a KVM host is still to be confirmed with `scripts/smoke-vm.sh`
+**Shipped**
+
+- [x] macOS backend on Apple Silicon (vfkit), the guest agent, the HTTP API, the CLI and the MCP server
+- [x] gVisor backend for Linux without KVM: tested end to end, from pulling the image to booting, exec, shared folders, restarts and copies
+- [x] A Docker Hub mirror fallback, so a first install on a shared VPS address doesn't fail on Docker Hub's pull limit
+- [x] One-line install and upgrade for macOS and Linux, with a launchd agent or a systemd service
+- [x] Per-VM network policy, idle stop and a `/v1/health` features list for clients
 - [x] Secrets kept out of VMs, and an egress allowlist with a log
-- [ ] Golden environments: set a project up once and start every VM from it
-- [ ] Checkpoints and forks
-- [ ] HTTPS proxy with a private-by-default URL for every VM
-- [ ] Sharing VMs and previews
-- [ ] Pairing a remote Cove server with Runo
-- [ ] Snapshots and a web dashboard
+- [x] Runo Connections: Cove on your Mac or on a server, by URL and API key, with agent turns that outlive your laptop
+- [x] Linux backend with KVM (cloud-hypervisor), booted and checked with `scripts/smoke-vm.sh` on a KVM VPS
+- [x] Pause and resume with memory kept, auto-pause with wake on use, timeouts, labels and rename
+- [x] Snapshots, `cove snapshot build` and a `universal` template; server settings; pairing codes and named keys
+
+**Next**
+
+- [ ] Pause to disk on a Mac (vfkit pauses with the memory kept in RAM)
+- [ ] SSH from any terminal: a gateway with keys and paste-anywhere tokens
+- [ ] Public HTTPS ports on your own domain, with wake on visit
+- [ ] Secrets stored on the server and changeable on a running VM
+- [ ] A desktop agents can drive (computer use), with share links
+- [ ] A TypeScript SDK and a web dashboard
 
 See [the full plan](docs/plan.md) for details and the security model.
 

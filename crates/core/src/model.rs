@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// A host folder shared into the VM with virtio-fs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -50,6 +51,155 @@ pub struct VmSpec {
     /// Secrets the egress proxy adds to requests, so their values never enter the VM.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<Secret>,
+    /// Pause the VM (memory and processes kept) after this many minutes without
+    /// activity. Using it again resumes it. Checked before `idle_stop_minutes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_pause_minutes: Option<u64>,
+    /// `key=value` metadata, for finding VMs later (`?label=task=review`). Not for
+    /// secrets: it is stored and shown in plain text.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+    /// The snapshot to start from instead of `image`. Kept on the record, so a VM
+    /// says where it came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
+    /// Pause or delete the VM at a set time. Used once: it is cleared when it fires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<Timeout>,
+}
+
+/// A one-off deadline for a VM.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Timeout {
+    /// Unix time in seconds.
+    pub at: u64,
+    #[serde(default)]
+    pub action: TimeoutAction,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TimeoutAction {
+    /// Keep its memory and processes, like an idle pause; it waits for `resume`.
+    #[default]
+    Pause,
+    /// Delete the VM and its disk.
+    Delete,
+}
+
+impl std::str::FromStr for TimeoutAction {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pause" | "suspend" => Ok(TimeoutAction::Pause),
+            "delete" | "kill" => Ok(TimeoutAction::Delete),
+            other => Err(format!(
+                "unknown timeout action {other:?} (use pause or delete)"
+            )),
+        }
+    }
+}
+
+/// Why a VM is paused. Only an idle pause wakes up by itself when used.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PauseReason {
+    /// Someone asked (`cove pause`): it waits for `resume`.
+    User,
+    /// Its auto-pause timer: exec, streams, files and port visits resume it.
+    Idle,
+    /// Its timeout fired: it waits for `resume`.
+    Timeout,
+}
+
+/// A change to a VM's settings (`PATCH /v1/vms/{name}`). Fields left out stay as
+/// they are; `null` clears a timer or the timeout.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VmUpdate {
+    /// Replaces every label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<BTreeMap<String, String>>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub auto_pause_minutes: Option<Option<u64>>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub idle_stop_minutes: Option<Option<u64>>,
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub timeout: Option<Option<TimeoutRequest>>,
+}
+
+/// "In this many minutes, do this."
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TimeoutRequest {
+    pub minutes: u64,
+    #[serde(default)]
+    pub action: TimeoutAction,
+}
+
+/// The longest timeout, as with Instabox: 24 hours.
+pub const MAX_TIMEOUT_MINUTES: u64 = 24 * 60;
+
+impl TimeoutRequest {
+    /// When it fires, counting `minute` seconds to the minute (60, but shorter in
+    /// tests: see [`crate::minute_secs`]).
+    pub fn resolve(self, now: u64, minute: u64) -> Result<Timeout, String> {
+        if self.minutes == 0 || self.minutes > MAX_TIMEOUT_MINUTES {
+            return Err(format!(
+                "a timeout is 1 minute to 24 hours ({} minutes); null clears it",
+                MAX_TIMEOUT_MINUTES
+            ));
+        }
+        Ok(Timeout {
+            at: now + self.minutes * minute,
+            action: self.action,
+        })
+    }
+}
+
+/// Tells a field that is present (even as `null`) from one that is left out.
+fn present<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(d).map(Some)
+}
+
+/// The most labels a VM may have, as with Instabox.
+pub const MAX_LABELS: usize = 32;
+
+/// Check a VM's labels: keys of letters, digits and `-_./`, short values.
+pub fn check_labels(labels: &BTreeMap<String, String>) -> Result<(), String> {
+    if labels.len() > MAX_LABELS {
+        return Err(format!("a VM has at most {MAX_LABELS} labels"));
+    }
+    for (k, v) in labels {
+        let key_ok = !k.is_empty()
+            && k.len() <= 63
+            && k.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c));
+        if !key_ok {
+            return Err(format!(
+                "label keys use letters, digits and - _ . / (max 63): {k:?}"
+            ));
+        }
+        if v.len() > 256 || v.chars().any(|c| c.is_control()) {
+            return Err(format!("label {k} is too long or has control characters"));
+        }
+    }
+    Ok(())
 }
 
 /// A secret kept on the host. Inside the VM, the variable `name` holds a placeholder;
@@ -72,6 +222,30 @@ pub struct Secret {
 pub struct SecretInfo {
     pub name: String,
     pub hosts: Vec<String>,
+}
+
+impl Default for VmSpec {
+    fn default() -> Self {
+        VmSpec {
+            name: String::new(),
+            image: default_image(),
+            cpus: default_cpus(),
+            memory_mb: default_memory(),
+            disk_gb: default_disk(),
+            mounts: Vec::new(),
+            ephemeral: false,
+            tags: Vec::new(),
+            backend: String::new(),
+            network: Network::Full,
+            idle_stop_minutes: None,
+            allow: Vec::new(),
+            secrets: Vec::new(),
+            auto_pause_minutes: None,
+            labels: BTreeMap::new(),
+            snapshot: None,
+            timeout: None,
+        }
+    }
 }
 
 impl VmSpec {
@@ -160,6 +334,8 @@ pub enum VmState {
     Starting,
     Running,
     Stopping,
+    /// Running, but frozen: memory and processes are kept, it uses no CPU.
+    Paused,
 }
 
 /// A VM as the API reports it.
@@ -184,6 +360,20 @@ pub struct VmStatus {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<SecretInfo>,
     pub created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_pause_minutes: Option<u64>,
+    /// Set while `state` is `paused`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_by: Option<PauseReason>,
+    /// Paused with its memory written to disk: it holds no memory or CPU at all.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paused_to_disk: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<Timeout>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Ports forwarded to the host: guest port -> host URL.
@@ -210,6 +400,55 @@ mod tests {
         let record: VmRecord = serde_json::from_str(old).unwrap();
         assert_eq!(record.spec.network, Network::Full);
         assert_eq!(record.spec.idle_stop_minutes, None);
+    }
+
+    #[test]
+    fn labels_are_checked() {
+        let mut labels = BTreeMap::new();
+        labels.insert("task".to_string(), "review".to_string());
+        labels.insert("runo/session".to_string(), "abc-1".to_string());
+        assert!(check_labels(&labels).is_ok());
+        labels.insert("bad key".to_string(), "x".to_string());
+        assert!(check_labels(&labels).is_err());
+        let many: BTreeMap<String, String> =
+            (0..33).map(|i| (format!("k{i}"), String::new())).collect();
+        assert!(check_labels(&many).is_err());
+    }
+
+    #[test]
+    fn new_fields_round_trip() {
+        let spec: VmSpec = serde_json::from_str(
+            r#"{"name":"a","auto_pause_minutes":30,"labels":{"task":"review"},
+                "snapshot":"base","timeout":{"at":100,"action":"delete"}}"#,
+        )
+        .unwrap();
+        assert_eq!(spec.auto_pause_minutes, Some(30));
+        assert_eq!(spec.labels["task"], "review");
+        assert_eq!(spec.snapshot.as_deref(), Some("base"));
+        assert_eq!(spec.timeout.unwrap().action, TimeoutAction::Delete);
+        assert_eq!("kill".parse::<TimeoutAction>(), Ok(TimeoutAction::Delete));
+        assert_eq!(
+            serde_json::to_string(&VmState::Paused).unwrap(),
+            r#""paused""#
+        );
+    }
+
+    #[test]
+    fn updates_tell_null_from_missing() {
+        let u: VmUpdate = serde_json::from_str(r#"{"auto_pause_minutes":null}"#).unwrap();
+        assert_eq!(u.auto_pause_minutes, Some(None));
+        assert_eq!(u.idle_stop_minutes, None);
+        let u: VmUpdate =
+            serde_json::from_str(r#"{"timeout":{"minutes":30,"action":"delete"}}"#).unwrap();
+        let t = u.timeout.unwrap().unwrap().resolve(1000, 60).unwrap();
+        assert_eq!((t.at, t.action), (1000 + 1800, TimeoutAction::Delete));
+        assert!(TimeoutRequest {
+            minutes: 0,
+            action: TimeoutAction::Pause
+        }
+        .resolve(0, 60)
+        .is_err());
+        assert!(serde_json::from_str::<VmUpdate>(r#"{"cpus":4}"#).is_err());
     }
 
     #[test]

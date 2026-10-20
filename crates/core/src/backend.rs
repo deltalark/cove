@@ -4,7 +4,7 @@
 //! not stop them; the server finds them again from `run.json`.
 
 use crate::guest::GuestAddr;
-use crate::model::{Network, VmRecord};
+use crate::model::{Network, PauseReason, VmRecord};
 use crate::paths::Paths;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -158,6 +158,15 @@ pub struct Launch {
     /// cloud-hypervisor: the VM's network slot, so no other VM takes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub net: Option<u32>,
+    /// Set while the VM is frozen, and why. Kept here so a restarted server knows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused: Option<PauseReason>,
+    /// Paused to disk: its memory is in `state/` and no process runs (`pid` is 0).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub saved: bool,
+    /// gVisor: the platform the sandbox runs on, which a restore must use too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
 }
 
 impl Launch {
@@ -175,8 +184,14 @@ impl Launch {
         let _ = std::fs::remove_file(vm_dir.join("run.json"));
     }
 
+    /// Whether its process runs. A VM paused to disk has none.
     pub fn alive(&self) -> bool {
-        pid_alive(self.pid)
+        self.pid != 0 && pid_alive(self.pid)
+    }
+
+    /// Running, or paused to disk: the VM exists past a stop.
+    pub fn present(&self) -> bool {
+        self.saved || self.alive()
     }
 
     /// Clean up after the VM: stop helpers (they exit by themselves when the VM does,
@@ -306,14 +321,18 @@ pub fn launch(record: &VmRecord, vm_dir: &Path, opts: &LaunchOptions) -> Result<
                 started_at: crate::now(),
                 helpers: vec![],
                 net: None,
+                paused: None,
+                saved: false,
+                platform: None,
             }
         }
         VFKIT => {
             let vfkit = which("vfkit").context("vfkit is not installed: brew install vfkit")?;
             let socket = vm_dir.join("guest.sock");
             let _ = std::fs::remove_file(&socket);
-            let mut cmd = std::process::Command::new(vfkit);
-            cmd.args(vfkit_args(record, vm_dir))
+            let _ = std::fs::remove_file(vm_dir.join("rest.sock"));
+            let mut cmd = std::process::Command::new(&vfkit);
+            cmd.args(vfkit_args(record, vm_dir, vfkit_vsock_mode(&vfkit)))
                 .stdout(log.try_clone()?)
                 .stderr(log);
             Launch {
@@ -322,6 +341,9 @@ pub fn launch(record: &VmRecord, vm_dir: &Path, opts: &LaunchOptions) -> Result<
                 started_at: crate::now(),
                 helpers: vec![],
                 net: None,
+                paused: None,
+                saved: false,
+                platform: None,
             }
         }
         CLOUD_HYPERVISOR => {
@@ -349,9 +371,10 @@ pub fn launch(record: &VmRecord, vm_dir: &Path, opts: &LaunchOptions) -> Result<
                 Network::Off | Network::Allowlist => None,
             };
             let helpers = crate::chv::start_virtiofsd(record, vm_dir, &log)?;
-            let mut cmd = std::process::Command::new(program);
+            let mut cmd = std::process::Command::new(&program);
+            let image_type = crate::chv::wants_image_type(&program);
             cmd.args(crate::chv::cloud_hypervisor_args(
-                record, vm_dir, &firmware, net,
+                record, vm_dir, &firmware, net, image_type,
             ))
             .stdout(log.try_clone()?)
             .stderr(log);
@@ -371,6 +394,9 @@ pub fn launch(record: &VmRecord, vm_dir: &Path, opts: &LaunchOptions) -> Result<
                 started_at: crate::now(),
                 helpers,
                 net: net.map(|n| n.0),
+                paused: None,
+                saved: false,
+                platform: None,
             }
         }
         GVISOR => {
@@ -388,11 +414,324 @@ pub fn launch(record: &VmRecord, vm_dir: &Path, opts: &LaunchOptions) -> Result<
     Ok(launch)
 }
 
+/// Freeze a running VM: its vCPUs (or processes) stop, memory stays where it is.
+pub async fn pause(record: &VmRecord, vm_dir: &Path, launch: &Launch) -> Result<()> {
+    match record.spec.backend.as_str() {
+        // The dev backend's "VM" is the agent's process group.
+        HOST => signal_group(launch.pid, libc::SIGSTOP),
+        VFKIT => vfkit_state(vm_dir, "Pause").await?,
+        CLOUD_HYPERVISOR => crate::chv::pause(vm_dir).await?,
+        GVISOR => crate::gvisor::pause(&record.spec.name, vm_dir)?,
+        other => bail!("{other} can't pause VMs"),
+    }
+    Ok(())
+}
+
+pub async fn resume(record: &VmRecord, vm_dir: &Path, launch: &Launch) -> Result<()> {
+    match record.spec.backend.as_str() {
+        HOST => signal_group(launch.pid, libc::SIGCONT),
+        VFKIT => vfkit_state(vm_dir, "Resume").await?,
+        CLOUD_HYPERVISOR => crate::chv::resume(vm_dir).await?,
+        GVISOR => crate::gvisor::resume(&record.spec.name, vm_dir)?,
+        other => bail!("{other} can't resume VMs"),
+    }
+    Ok(())
+}
+
+/// Whether this VM can be paused to disk, freeing its memory.
+pub fn can_save(record: &VmRecord) -> bool {
+    match record.spec.backend.as_str() {
+        // With shared folders, only while nothing in the VM uses them (see save).
+        CLOUD_HYPERVISOR | GVISOR => true,
+        _ => false,
+    }
+}
+
+/// Write a running VM's memory to disk and end its process. `launch` becomes saved.
+/// On failure the VM is left running, as it was.
+pub async fn save(record: &VmRecord, vm_dir: &Path, launch: &mut Launch) -> Result<()> {
+    match record.spec.backend.as_str() {
+        CLOUD_HYPERVISOR => {
+            let folders = !record.spec.mounts.is_empty();
+            if folders {
+                unmount_folders(record, launch).await?;
+                if let Err(e) = crate::chv::unplug_folders(record, vm_dir).await {
+                    replug(record, vm_dir, launch).await;
+                    return Err(e);
+                }
+                crate::chv::stop_helpers(&launch.helpers);
+                launch.helpers.clear();
+            }
+            let saved = match crate::chv::pause(vm_dir).await {
+                Ok(()) => crate::chv::save(vm_dir).await,
+                Err(e) => Err(e),
+            };
+            if let Err(e) = saved {
+                let _ = crate::chv::resume(vm_dir).await;
+                if folders {
+                    replug(record, vm_dir, launch).await;
+                }
+                return Err(e);
+            }
+        }
+        GVISOR => crate::gvisor::save(&record.spec.name, vm_dir, launch).await?,
+        other => bail!("{other} can't pause VMs to disk"),
+    }
+    signal(launch.pid, libc::SIGKILL);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while pid_alive(launch.pid) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    crate::chv::stop_helpers(&launch.helpers);
+    launch.helpers.clear();
+    launch.pid = 0;
+    launch.saved = true;
+    Ok(())
+}
+
+/// Start a VM paused to disk again, from where it was, and running.
+pub async fn restore(record: &VmRecord, vm_dir: &Path, launch: &mut Launch) -> Result<()> {
+    match record.spec.backend.as_str() {
+        CLOUD_HYPERVISOR => {
+            let program = which("cloud-hypervisor")
+                .context("cloud-hypervisor is not installed (see cove doctor)")?;
+            if record.spec.network == Network::Full {
+                crate::chv::setup_nat()?;
+            }
+            for stale in ["vsock.sock", "api.sock"] {
+                let _ = std::fs::remove_file(vm_dir.join(stale));
+            }
+            let log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(vm_dir.join("backend.log"))?;
+            let mut cmd = std::process::Command::new(&program);
+            cmd.args(crate::chv::restore_args(vm_dir))
+                .stdout(log.try_clone()?)
+                .stderr(log);
+            let pid = spawn_detached(cmd)?;
+            // Wait for its API, which answers once the memory is loaded.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            loop {
+                if !pid_alive(pid) {
+                    bail!("cloud-hypervisor exited while restoring (see backend.log)");
+                }
+                if vm_dir.join("api.sock").exists()
+                    && unix_http(&vm_dir.join("api.sock"), "GET", "/api/v1/vm.info", None)
+                        .await
+                        .is_ok_and(|(code, _)| code == 200)
+                {
+                    break;
+                }
+                if std::time::Instant::now() > deadline {
+                    signal(pid, libc::SIGKILL);
+                    bail!("cloud-hypervisor didn't finish restoring");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            if let Err(e) = crate::chv::resume(vm_dir).await {
+                signal(pid, libc::SIGKILL);
+                return Err(e);
+            }
+            launch.pid = pid;
+            if !record.spec.mounts.is_empty() {
+                match crate::chv::plug_folders(record, vm_dir).await {
+                    Ok(helpers) => launch.helpers = helpers,
+                    Err(e) => {
+                        signal(pid, libc::SIGKILL);
+                        return Err(e.context("plugging the shared folders back in"));
+                    }
+                }
+            }
+        }
+        GVISOR => {
+            let platform = launch.platform.clone().unwrap_or_else(|| "systrap".into());
+            let net = match record.spec.network {
+                Network::Full => launch.net.map(crate::chv::NetSlot),
+                _ => None,
+            };
+            launch.pid = crate::gvisor::restore(record, vm_dir, &platform, net)?;
+        }
+        other => bail!("{other} can't restore VMs from disk"),
+    }
+    launch.saved = false;
+    Ok(())
+}
+
+/// Unmount a VM's shared folders in the guest. Fails, leaving them all mounted,
+/// when something in the VM is using one (an open file, a shell's working folder).
+async fn unmount_folders(record: &VmRecord, launch: &Launch) -> Result<()> {
+    let mut done = Vec::new();
+    for (i, m) in record.spec.mounts.iter().enumerate() {
+        let out = launch
+            .guest
+            .exec(cove_proto::Command {
+                cmd: vec!["umount".into(), m.guest.clone()],
+                ..Default::default()
+            })
+            .await?;
+        if out.code != Some(0) {
+            for j in done {
+                remount(record, launch, j).await;
+            }
+            bail!(
+                "{} is in use in the VM ({})",
+                m.guest,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        done.push(i);
+    }
+    Ok(())
+}
+
+async fn remount(record: &VmRecord, launch: &Launch, i: usize) {
+    let m = &record.spec.mounts[i];
+    let _ = launch
+        .guest
+        .call(&cove_proto::Request::Mount {
+            tag: mount_tag(i),
+            path: m.guest.clone(),
+            read_only: m.read_only,
+        })
+        .await;
+}
+
+/// Plug a VM's shared folders back in and mount them, after an unplug.
+async fn replug(record: &VmRecord, vm_dir: &Path, launch: &mut Launch) {
+    match crate::chv::plug_folders(record, vm_dir).await {
+        Ok(helpers) => launch.helpers = helpers,
+        Err(e) => eprintln!(
+            "{}: couldn't plug its shared folders back: {e:#}",
+            record.spec.name
+        ),
+    }
+    remount_all(record, launch).await;
+}
+
+/// Mount every shared folder in the guest, waiting a little for hotplugged devices.
+pub async fn remount_all(record: &VmRecord, launch: &Launch) {
+    for i in 0..record.spec.mounts.len() {
+        let m = &record.spec.mounts[i];
+        for _ in 0..50 {
+            let ok = launch
+                .guest
+                .call(&cove_proto::Request::Mount {
+                    tag: mount_tag(i),
+                    path: m.guest.clone(),
+                    read_only: m.read_only,
+                })
+                .await
+                .is_ok();
+            if ok {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+}
+
+fn signal_group(pid: u32, sig: i32) {
+    unsafe {
+        libc::kill(-(pid as libc::pid_t), sig);
+        libc::kill(pid as libc::pid_t, sig);
+    }
+}
+
+/// Change a vfkit VM's state through its REST socket (`Pause`, `Resume`).
+async fn vfkit_state(vm_dir: &Path, state: &str) -> Result<()> {
+    let socket = vm_dir.join("rest.sock");
+    if !socket.exists() {
+        bail!("this VM was started by an older Cove, which can't pause it; stop and start it once");
+    }
+    let body = serde_json::json!({ "state": state }).to_string();
+    let (code, line) = unix_http(&socket, "POST", "/vm/state", Some(&body)).await?;
+    if !(200..300).contains(&code) {
+        bail!("vfkit {state}: {line}");
+    }
+    Ok(())
+}
+
+/// One HTTP/1.1 request over a Unix socket; returns the status code and line.
+pub async fn unix_http(
+    socket: &Path,
+    method: &str,
+    uri: &str,
+    body: Option<&str>,
+) -> Result<(u16, String)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = crate::guest::connect_unix(socket)
+        .await
+        .with_context(|| format!("connect {}", socket.display()))?;
+    let body = body.unwrap_or("");
+    let mut request = format!(
+        "{method} {uri} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n",
+        body.len()
+    );
+    if !body.is_empty() {
+        request.push_str("Content-Type: application/json\r\n");
+    }
+    request.push_str("\r\n");
+    request.push_str(body);
+    s.write_all(request.as_bytes()).await?;
+    let mut reply = Vec::new();
+    let mut buf = [0u8; 256];
+    // The status line is all we need.
+    while !reply.contains(&b'\n') {
+        let n = tokio::time::timeout(std::time::Duration::from_secs(10), s.read(&mut buf))
+            .await
+            .context("no answer")??;
+        if n == 0 {
+            break;
+        }
+        reply.extend_from_slice(&buf[..n]);
+    }
+    let text = String::from_utf8_lossy(&reply);
+    let line = text.lines().next().unwrap_or("").to_string();
+    let code = line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .with_context(|| format!("bad HTTP reply: {line:?}"))?;
+    Ok((code, line))
+}
+
 pub fn mount_tag(index: usize) -> String {
     format!("cove{index}")
 }
 
-pub fn vfkit_args(record: &VmRecord, vm_dir: &Path) -> Vec<String> {
+/// How to ask vfkit to expose the agent's vsock port on a Unix socket that Cove
+/// connects to. vfkit 0.6 swapped the meaning of its two modes: before it, `listen`
+/// did this; from it, `connect` does.
+pub fn vfkit_vsock_mode(vfkit: &Path) -> &'static str {
+    static MODE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    MODE.get_or_init(|| {
+        let text = std::process::Command::new(vfkit)
+            .arg("--version")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        vsock_mode_for(&text)
+    })
+}
+
+/// The mode for `vfkit --version` output such as "vfkit version: v0.6.4".
+pub fn vsock_mode_for(version: &str) -> &'static str {
+    let numbers: Vec<u32> = version
+        .rsplit(['v', ' '])
+        .next()
+        .unwrap_or("")
+        .split('.')
+        .map_while(|p| p.trim().parse().ok())
+        .collect();
+    match numbers.as_slice() {
+        [0, minor, ..] if *minor < 6 => "listen",
+        // Unknown output: assume a current vfkit.
+        _ => "connect",
+    }
+}
+
+pub fn vfkit_args(record: &VmRecord, vm_dir: &Path, vsock_mode: &str) -> Vec<String> {
     let d = |name: &str| vm_dir.join(name).display().to_string();
     let mut args = vec![
         "--cpus".into(),
@@ -415,10 +754,13 @@ pub fn vfkit_args(record: &VmRecord, vm_dir: &Path) -> Vec<String> {
     args.extend([
         "--device".into(),
         format!(
-            "virtio-vsock,port={},socketURL={},listen",
+            "virtio-vsock,port={},socketURL={},{vsock_mode}",
             cove_proto::GUEST_PORT,
             d("guest.sock")
         ),
+        // For pause and resume.
+        "--restful-uri".into(),
+        format!("unix://{}", d("rest.sock")),
         "--device".into(),
         "virtio-rng".into(),
         "--device".into(),
@@ -461,17 +803,28 @@ mod tests {
                 idle_stop_minutes: None,
                 allow: Vec::new(),
                 secrets: Vec::new(),
+                ..VmSpec::default()
             },
             created_at: 0,
             instance_id: "x".into(),
         };
-        let args = vfkit_args(&record, Path::new("/vms/a")).join(" ");
+        let args = vfkit_args(&record, Path::new("/vms/a"), "connect").join(" ");
         assert!(args.starts_with(
             "--cpus 4 --memory 8192 --bootloader efi,variable-store=/vms/a/efi-vars,create"
         ));
         assert!(args.contains("--device virtio-net,nat"));
-        assert!(args.contains("--device virtio-vsock,port=1024,socketURL=/vms/a/guest.sock,listen"));
+        assert!(
+            args.contains("--device virtio-vsock,port=1024,socketURL=/vms/a/guest.sock,connect")
+        );
         assert!(args.ends_with("--device virtio-fs,sharedDir=/Users/me/app,mountTag=cove0"));
+    }
+
+    #[test]
+    fn vsock_mode_follows_the_vfkit_version() {
+        assert_eq!(vsock_mode_for("vfkit version: v0.6.4\n"), "connect");
+        assert_eq!(vsock_mode_for("vfkit version: v0.5.1\n"), "listen");
+        assert_eq!(vsock_mode_for("vfkit version: v1.0.0"), "connect");
+        assert_eq!(vsock_mode_for(""), "connect");
     }
 
     #[test]
@@ -491,11 +844,12 @@ mod tests {
                 idle_stop_minutes: None,
                 allow: Vec::new(),
                 secrets: Vec::new(),
+                ..VmSpec::default()
             },
             created_at: 0,
             instance_id: "x".into(),
         };
-        let args = vfkit_args(&record, Path::new("/vms/a")).join(" ");
+        let args = vfkit_args(&record, Path::new("/vms/a"), "connect").join(" ");
         assert!(!args.contains("virtio-net"));
         // The agent's channel is still there.
         assert!(args.contains("virtio-vsock"));
@@ -518,11 +872,15 @@ mod launch_tests {
             started_at: 7,
             helpers: vec![43, 44],
             net: Some(3),
+            paused: Some(PauseReason::Idle),
+            saved: false,
+            platform: None,
         };
         launch.save(dir.path()).unwrap();
         let back = Launch::load(dir.path()).unwrap();
         assert_eq!(back.guest, launch.guest);
         assert_eq!((back.helpers, back.net), (vec![43, 44], Some(3)));
+        assert_eq!(back.paused, Some(PauseReason::Idle));
         // run.json from before helpers and network slots existed.
         std::fs::write(
             dir.path().join("run.json"),

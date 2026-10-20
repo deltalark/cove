@@ -9,6 +9,10 @@
 //! vms/<name>/seed.img     cloud-init seed, rebuilt on every start
 //! vms/<name>/run.json     how to reach the running VM (pid, guest address)
 //! vms/<name>/console.log  serial console
+//! snapshots/<name>/        a saved VM: snapshot.json and disk.raw (or rootfs/)
+//! settings.json           server defaults for new VMs (`/v1/settings`)
+//! keys.json               named API keys, hashed (`cove keys`, pairing)
+//! login.json              this client's saved server (`cove login`)
 //! guest/cove-guest-<arch>  guest agent binaries copied into VMs
 //! firmware/CLOUDHV*.fd    cloud-hypervisor's EFI firmware (Linux)
 //! ```
@@ -55,6 +59,21 @@ impl Paths {
     pub fn vm_dir(&self, name: &str) -> PathBuf {
         self.vms().join(name)
     }
+    pub fn snapshots(&self) -> PathBuf {
+        self.root.join("snapshots")
+    }
+    pub fn snapshot_dir(&self, name: &str) -> PathBuf {
+        self.snapshots().join(name)
+    }
+    pub fn settings_file(&self) -> PathBuf {
+        self.root.join("settings.json")
+    }
+    pub fn keys_file(&self) -> PathBuf {
+        self.root.join("keys.json")
+    }
+    pub fn login_file(&self) -> PathBuf {
+        self.root.join("login.json")
+    }
     pub fn guest_dir(&self) -> PathBuf {
         self.root.join("guest")
     }
@@ -67,6 +86,7 @@ impl Paths {
             self.root.clone(),
             self.images(),
             self.vms(),
+            self.snapshots(),
             self.guest_dir(),
         ] {
             std::fs::create_dir_all(&dir)?;

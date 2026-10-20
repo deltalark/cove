@@ -17,13 +17,16 @@ pub struct Client {
 }
 
 impl Client {
-    /// `--host`/`COVE_URL`, else the local server's `server.json`, else the default port.
-    /// `COVE_API_KEY`, else the local `api-key` file.
+    /// `--host`/`COVE_URL`, else the server `cove login` saved, else the local
+    /// server's `server.json`, else the default port. `COVE_API_KEY`, else the saved
+    /// login's key for that server, else the local `api-key` file.
     pub fn from_env(host: Option<String>) -> Result<Client> {
         let paths = Paths::from_env();
         let url = server_url(host);
+        let login = load_login(&paths).filter(|l| l.url == url);
         let key = match std::env::var("COVE_API_KEY") {
             Ok(k) => k,
+            Err(_) if login.is_some() => login.map(|l| l.key).unwrap_or_default(),
             Err(_) => std::fs::read_to_string(paths.api_key())
                 .map(|k| k.trim().to_string())
                 .with_context(|| {
@@ -73,6 +76,16 @@ impl Client {
 
     pub async fn post<T: DeserializeOwned>(&self, path: &str, body: &impl Serialize) -> Result<T> {
         self.send(self.http.post(self.endpoint(path)).json(body))
+            .await
+    }
+
+    pub async fn put<T: DeserializeOwned>(&self, path: &str, body: &impl Serialize) -> Result<T> {
+        self.send(self.http.put(self.endpoint(path)).json(body))
+            .await
+    }
+
+    pub async fn patch<T: DeserializeOwned>(&self, path: &str, body: &impl Serialize) -> Result<T> {
+        self.send(self.http.patch(self.endpoint(path)).json(body))
             .await
     }
 
@@ -143,11 +156,58 @@ impl Client {
     }
 }
 
-/// The server to talk to: `--host`/`COVE_URL`, else the local server's
-/// `server.json`, else the default port.
+/// A server this client logged in to with `cove login`.
+#[derive(serde::Deserialize, Serialize)]
+pub struct Login {
+    pub url: String,
+    pub key: String,
+}
+
+pub fn load_login(paths: &Paths) -> Option<Login> {
+    let text = std::fs::read_to_string(paths.login_file()).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+pub fn save_login(paths: &Paths, url: &str, key: &str) -> Result<()> {
+    std::fs::create_dir_all(&paths.root)?;
+    let path = paths.login_file();
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&Login {
+            url: url.to_string(),
+            key: key.to_string(),
+        })?,
+    )?;
+    cove_core::paths::restrict(&path, 0o600);
+    Ok(())
+}
+
+/// Trade a pairing code for a key of our own (`POST /v1/pair`, which needs none).
+pub async fn pair(url: &str, code: &str, name: &str) -> Result<serde_json::Value> {
+    let response = reqwest::Client::new()
+        .post(format!("{url}/v1/pair"))
+        .json(&serde_json::json!({ "code": code, "name": name }))
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .with_context(|| format!("can't reach the cove server at {url}"))?;
+    let status = response.status();
+    let v: serde_json::Value = response.json().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!(
+            "{}",
+            v["error"].as_str().unwrap_or("the server refused the code")
+        );
+    }
+    Ok(v)
+}
+
+/// The server to talk to: `--host`/`COVE_URL`, else the server `cove login` saved,
+/// else the local server's `server.json`, else the default port.
 pub fn server_url(host: Option<String>) -> String {
     let url = host
         .or_else(|| std::env::var("COVE_URL").ok())
+        .or_else(|| load_login(&Paths::from_env()).map(|l| l.url))
         .or_else(|| {
             let text = std::fs::read_to_string(Paths::from_env().server_file()).ok()?;
             let v: serde_json::Value = serde_json::from_str(&text).ok()?;

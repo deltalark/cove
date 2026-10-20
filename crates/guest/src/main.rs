@@ -8,9 +8,10 @@ mod procs;
 mod system;
 
 use cove_proto::{line, Frame, Input, Request};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 trait Stream: Read + Write + Send {
     fn duplicate(&self) -> std::io::Result<Box<dyn Stream>>;
@@ -139,14 +140,33 @@ fn serve(listen: &str) -> std::io::Result<()> {
                 std::thread::spawn(move || handle(Box::new(conn)));
             }
         }
-        "unix" => {
+        "unix" => loop {
             let _ = std::fs::remove_file(rest);
             let listener = std::os::unix::net::UnixListener::bind(rest)?;
+            listener.set_nonblocking(true)?;
             eprintln!("cove-guest listening on unix:{rest}");
-            for conn in listener.incoming().flatten() {
-                std::thread::spawn(move || handle(Box::new(conn)));
+            while !SUSPENDING.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((conn, _)) => {
+                        let _ = conn.set_nonblocking(false);
+                        std::thread::spawn(move || handle(Box::new(conn)));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        wait_readable(&listener, 200);
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                }
             }
-        }
+            // Suspended: no socket to the host until the host removes the marker,
+            // which it does once the sandbox is restored (or the checkpoint failed).
+            drop(listener);
+            let _ = std::fs::remove_file(rest);
+            let marker = MARKER.lock().unwrap().clone();
+            while std::path::Path::new(&marker).exists() {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            SUSPENDING.store(false, Ordering::SeqCst);
+        },
         #[cfg(target_os = "linux")]
         "vsock" => {
             let port: u32 = rest.parse().unwrap_or_else(|_| usage());
@@ -162,6 +182,39 @@ fn serve(listen: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Set by `Suspend`: the unix listener stops and waits for [`MARKER`] to go.
+static SUSPENDING: AtomicBool = AtomicBool::new(false);
+static MARKER: Mutex<String> = Mutex::new(String::new());
+
+/// Every connection being served, so `Suspend` can close them all.
+fn open_streams() -> &'static Mutex<HashMap<u64, Box<dyn Stream>>> {
+    static OPEN: OnceLock<Mutex<HashMap<u64, Box<dyn Stream>>>> = OnceLock::new();
+    OPEN.get_or_init(Default::default)
+}
+
+static NEXT_STREAM: AtomicU64 = AtomicU64::new(0);
+
+/// Keeps a connection listed in [`open_streams`] while it is served.
+struct Listed(u64);
+
+impl Drop for Listed {
+    fn drop(&mut self) {
+        open_streams().lock().unwrap().remove(&self.0);
+    }
+}
+
+fn wait_readable(listener: &std::os::unix::net::UnixListener, millis: i32) {
+    use std::os::unix::io::AsRawFd;
+    let mut fd = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    unsafe {
+        libc::poll(&mut fd, 1, millis);
+    }
+}
+
 type Writer = Arc<Mutex<Box<dyn Stream>>>;
 
 fn send(writer: &Writer, frame: &Frame) -> bool {
@@ -173,6 +226,11 @@ fn handle(conn: Box<dyn Stream>) {
     let Ok(read_half) = conn.duplicate() else {
         return;
     };
+    let id = NEXT_STREAM.fetch_add(1, Ordering::SeqCst);
+    let _listed = conn.duplicate().ok().map(|d| {
+        open_streams().lock().unwrap().insert(id, d);
+        Listed(id)
+    });
     let mut reader = BufReader::new(read_half);
     let writer: Writer = Arc::new(Mutex::new(conn));
     let mut first = String::new();
@@ -281,6 +339,19 @@ fn handle(conn: Box<dyn Stream>) {
                 send(&writer, &Frame::error(e));
             }
         },
+        Request::Suspend { marker } => {
+            *MARKER.lock().unwrap() = marker;
+            SUSPENDING.store(true, Ordering::SeqCst);
+            egress::release_waiters();
+            // Every other stream ends: their handlers see the shutdown and return.
+            for (other, s) in open_streams().lock().unwrap().iter() {
+                if *other != id {
+                    s.close();
+                }
+            }
+            send(&writer, &Frame::ok(true));
+            writer.lock().unwrap().close();
+        }
         Request::Tcp { port } => {
             let target = std::net::TcpStream::connect(("127.0.0.1", port))
                 .or_else(|_| std::net::TcpStream::connect(("::1", port)));

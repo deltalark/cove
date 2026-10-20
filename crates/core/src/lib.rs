@@ -3,14 +3,18 @@
 
 pub mod backend;
 pub mod chv;
+pub mod disk;
 pub mod egress;
 pub mod guest;
 pub mod gvisor;
 pub mod image;
+pub mod keys;
 pub mod manager;
 pub mod model;
 pub mod paths;
 pub mod seed;
+pub mod settings;
+pub mod snapshot;
 
 pub use manager::Manager;
 pub use model::{Mount, Network, VmRecord, VmSpec, VmState, VmStatus};
@@ -31,6 +35,16 @@ pub fn valid_name(name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
         && !name.starts_with('-')
         && !name.ends_with('-')
+}
+
+/// How many seconds a minute of the idle timers and timeouts lasts: 60, unless
+/// `COVE_IDLE_MINUTE_SECS` shortens it so tests don't wait for real minutes.
+pub fn minute_secs() -> u64 {
+    std::env::var("COVE_IDLE_MINUTE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(60)
 }
 
 pub fn now() -> u64 {

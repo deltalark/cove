@@ -7,7 +7,12 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::Duration;
+
+/// Bumped to make every waiting [`accept`] give up (before a checkpoint).
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
 struct Queue {
@@ -49,12 +54,28 @@ fn listen(listener: TcpListener) -> Arc<Queue> {
 /// Wait for the next program to connect to `port`.
 pub fn accept(port: u16) -> Result<TcpStream, String> {
     let q = queue(port)?;
+    let generation = GENERATION.load(Ordering::SeqCst);
     let mut conns = q.conns.lock().unwrap();
     loop {
         if let Some(conn) = conns.pop_front() {
             return Ok(conn);
         }
-        conns = q.ready.wait(conns).unwrap();
+        if GENERATION.load(Ordering::SeqCst) != generation {
+            return Err("the agent is suspending".into());
+        }
+        conns = q
+            .ready
+            .wait_timeout(conns, Duration::from_millis(200))
+            .unwrap()
+            .0;
+    }
+}
+
+/// Make every waiting `accept` return, so their host streams close.
+pub fn release_waiters() {
+    GENERATION.fetch_add(1, Ordering::SeqCst);
+    for q in queues().lock().unwrap().values() {
+        q.ready.notify_all();
     }
 }
 

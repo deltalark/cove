@@ -121,13 +121,27 @@ pub fn virtiofsd_args(mount: &Mount, socket: &Path, root: bool) -> Vec<String> {
     args
 }
 
+/// Whether this cloud-hypervisor wants `image_type=` on its disks. v54 refuses
+/// disks without it, and versions before it refuse the option, so ask its `--help`.
+pub fn wants_image_type(program: &Path) -> bool {
+    static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ANSWER.get_or_init(|| {
+        std::process::Command::new(program)
+            .arg("--help")
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("image_type="))
+    })
+}
+
 pub fn cloud_hypervisor_args(
     record: &VmRecord,
     vm_dir: &Path,
     firmware: &Path,
     net: Option<NetSlot>,
+    image_type: bool,
 ) -> Vec<String> {
     let d = |name: &str| vm_dir.join(name).display().to_string();
+    let raw = if image_type { ",image_type=raw" } else { "" };
     let mut args = vec![
         "--firmware".into(),
         firmware.display().to_string(),
@@ -137,8 +151,8 @@ pub fn cloud_hypervisor_args(
         "--memory".into(),
         format!("size={}M,shared=on", record.spec.memory_mb),
         "--disk".into(),
-        format!("path={}", d("disk.raw")),
-        format!("path={},readonly=on", d("seed.img")),
+        format!("path={}{raw}", d("disk.raw")),
+        format!("path={},readonly=on{raw}", d("seed.img")),
         "--vsock".into(),
         format!("cid=3,socket={}", d("vsock.sock")),
         "--api-socket".into(),
@@ -164,9 +178,10 @@ pub fn cloud_hypervisor_args(
         args.push("--fs".into());
         for i in 0..record.spec.mounts.len() {
             args.push(format!(
-                "tag={},socket={},num_queues=1,queue_size=512",
+                "tag={},socket={},num_queues=1,queue_size=512,id={}",
                 crate::backend::mount_tag(i),
-                fs_socket(vm_dir, i).display()
+                fs_socket(vm_dir, i).display(),
+                fs_id(i)
             ));
         }
     }
@@ -252,19 +267,109 @@ pub fn setup_nat() -> Result<()> {
 /// Ask cloud-hypervisor to press the VM's power button (ACPI shutdown), for when the
 /// guest agent doesn't answer.
 pub async fn power_button(vm_dir: &Path) -> Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut s = crate::guest::connect_unix(&vm_dir.join("api.sock")).await?;
-    s.write_all(
-        b"PUT /api/v1/vm.power-button HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+    api_put(vm_dir, "vm.power-button").await
+}
+
+/// Freeze the VM's vCPUs; memory stays as it is.
+pub async fn pause(vm_dir: &Path) -> Result<()> {
+    api_put(vm_dir, "vm.pause").await
+}
+
+pub async fn resume(vm_dir: &Path) -> Result<()> {
+    api_put(vm_dir, "vm.resume").await
+}
+
+/// `PUT /api/v1/<action>` on the VM's API socket.
+async fn api_put(vm_dir: &Path, action: &str) -> Result<()> {
+    api_put_body(vm_dir, action, None).await
+}
+
+async fn api_put_body(vm_dir: &Path, action: &str, body: Option<&str>) -> Result<()> {
+    let status = crate::backend::unix_http(
+        &vm_dir.join("api.sock"),
+        "PUT",
+        &format!("/api/v1/{action}"),
+        body,
     )
     .await?;
-    let mut reply = [0u8; 64];
-    let n = s.read(&mut reply).await?;
-    let status = String::from_utf8_lossy(&reply[..n]);
-    if !status.starts_with("HTTP/1.1 2") {
-        bail!("cloud-hypervisor: {}", status.lines().next().unwrap_or(""));
+    if !(200..300).contains(&status.0) {
+        bail!("cloud-hypervisor {action}: {}", status.1);
     }
     Ok(())
+}
+
+/// Where a VM paused to disk keeps its memory and device state.
+pub fn state_dir(vm_dir: &Path) -> std::path::PathBuf {
+    vm_dir.join("state")
+}
+
+/// The device id of shared folder `index`, so it can be unplugged and plugged back.
+pub fn fs_id(index: usize) -> String {
+    format!("fs{index}")
+}
+
+/// Unplug a VM's shared folders: cloud-hypervisor can't snapshot vhost-user devices,
+/// which is what virtio-fs is. The guest must have unmounted them.
+pub async fn unplug_folders(record: &VmRecord, vm_dir: &Path) -> Result<()> {
+    for i in 0..record.spec.mounts.len() {
+        let body = serde_json::json!({ "id": fs_id(i) }).to_string();
+        api_put_body(vm_dir, "vm.remove-device", Some(&body)).await?;
+    }
+    // The guest acknowledges the unplug on its own time.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    Ok(())
+}
+
+/// Start virtiofsd again and plug the VM's shared folders back in; returns the
+/// helpers' pids. The guest mounts them afterwards.
+pub async fn plug_folders(record: &VmRecord, vm_dir: &Path) -> Result<Vec<u32>> {
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(vm_dir.join("backend.log"))?;
+    let helpers = start_virtiofsd(record, vm_dir, &log)?;
+    for i in 0..record.spec.mounts.len() {
+        let body = serde_json::json!({
+            "tag": crate::backend::mount_tag(i),
+            "socket": fs_socket(vm_dir, i).display().to_string(),
+            "num_queues": 1,
+            "queue_size": 512,
+            "id": fs_id(i),
+        })
+        .to_string();
+        if let Err(e) = api_put_body(vm_dir, "vm.add-fs", Some(&body)).await {
+            stop_helpers(&helpers);
+            return Err(e);
+        }
+    }
+    Ok(helpers)
+}
+
+/// Write a paused VM's memory and devices to [`state_dir`].
+pub async fn save(vm_dir: &Path) -> Result<()> {
+    let state = state_dir(vm_dir);
+    let _ = std::fs::remove_dir_all(&state);
+    std::fs::create_dir_all(&state)?;
+    crate::paths::restrict(&state, 0o700);
+    let body =
+        serde_json::json!({ "destination_url": format!("file://{}", state.display()) }).to_string();
+    // Writing out the memory takes a while for a big VM.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        api_put_body(vm_dir, "vm.snapshot", Some(&body)),
+    )
+    .await
+    .context("saving the VM's memory took too long")?
+}
+
+/// The command line that brings a saved VM back (paused; `resume` starts it).
+pub fn restore_args(vm_dir: &Path) -> Vec<String> {
+    vec![
+        "--api-socket".into(),
+        format!("path={}", vm_dir.join("api.sock").display()),
+        "--restore".into(),
+        format!("source_url=file://{}", state_dir(vm_dir).display()),
+    ]
 }
 
 /// Whether this process may create tap devices and change iptables.
@@ -469,6 +574,7 @@ mod tests {
                 idle_stop_minutes: None,
                 allow: Vec::new(),
                 secrets: Vec::new(),
+                ..VmSpec::default()
             },
             created_at: 0,
             instance_id: "x".into(),
@@ -491,6 +597,7 @@ mod tests {
             Path::new("/vms/a"),
             Path::new("/fw/CLOUDHV.fd"),
             Some(NetSlot(5)),
+            false,
         )
         .join(" ");
         assert!(args.starts_with("--firmware /fw/CLOUDHV.fd --cpus boot=4"));
@@ -503,13 +610,25 @@ mod tests {
         assert!(args.contains("--serial file=/vms/a/console.log --console off"));
         assert!(args
             .contains("--net tap=cove5,mac=52:54:00:c0:00:05,ip=10.177.0.21,mask=255.255.255.252"));
-        assert!(args.ends_with("--fs tag=cove0,socket=/vms/a/fs0.sock,num_queues=1,queue_size=512"));
+        assert!(args
+            .ends_with("--fs tag=cove0,socket=/vms/a/fs0.sock,num_queues=1,queue_size=512,id=fs0"));
+    }
+
+    #[test]
+    fn newer_versions_name_the_image_type() {
+        let r = record(Network::Off, vec![]);
+        let args =
+            cloud_hypervisor_args(&r, Path::new("/v"), Path::new("/fw"), None, true).join(" ");
+        assert!(args.contains(
+            "--disk path=/v/disk.raw,image_type=raw path=/v/seed.img,readonly=on,image_type=raw"
+        ));
     }
 
     #[test]
     fn no_network_no_nic() {
         let r = record(Network::Off, vec![]);
-        let args = cloud_hypervisor_args(&r, Path::new("/v"), Path::new("/fw"), None).join(" ");
+        let args =
+            cloud_hypervisor_args(&r, Path::new("/v"), Path::new("/fw"), None, false).join(" ");
         assert!(!args.contains("--net"));
         assert!(!args.contains("--fs"));
         assert!(args.contains("--vsock"));

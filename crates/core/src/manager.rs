@@ -3,8 +3,12 @@
 use crate::backend::{self, Launch};
 use crate::egress::{policy, policy::Policy, tls::Tls, Egress};
 use crate::guest::GuestAddr;
-use crate::model::{Forward, Network, VmRecord, VmSpec, VmState, VmStatus};
+use crate::model::{
+    Forward, Network, PauseReason, Timeout, TimeoutAction, VmRecord, VmSpec, VmState, VmStatus,
+    VmUpdate,
+};
 use crate::paths::Paths;
+use crate::snapshot::{self, SnapshotInfo};
 use crate::{image, seed};
 use anyhow::{anyhow, bail, Context, Result};
 use cove_proto::Request;
@@ -175,6 +179,10 @@ impl Manager {
     }
 
     fn record(&self, name: &str) -> Result<VmRecord> {
+        // Names come from URLs: never let one reach outside vms/.
+        if !crate::valid_name(name) {
+            bail!("no VM named {name:?}");
+        }
         let path = self.paths.vm_dir(name).join("vm.json");
         let text = std::fs::read_to_string(&path).map_err(|_| anyhow!("no VM named {name:?}"))?;
         Ok(serde_json::from_str(&text)?)
@@ -212,13 +220,16 @@ impl Manager {
     pub async fn status(&self, name: &str) -> Result<VmStatus> {
         let record = self.record(name)?;
         let dir = self.paths.vm_dir(name);
-        let running = Launch::load(&dir).is_some_and(|l| l.alive());
+        let launch = Launch::load(&dir).filter(|l| l.present());
+        let paused_by = launch.as_ref().and_then(|l| l.paused);
+        let paused_to_disk = launch.as_ref().is_some_and(|l| l.saved);
         let live = self.live.lock().await;
         let entry = live.get(name);
         let state = match entry.and_then(|l| l.state) {
             Some(VmState::Starting) => VmState::Starting,
             Some(VmState::Stopping) => VmState::Stopping,
-            _ if running => VmState::Running,
+            _ if paused_by.is_some() => VmState::Paused,
+            _ if launch.is_some() => VmState::Running,
             _ => VmState::Stopped,
         };
         Ok(VmStatus {
@@ -244,6 +255,12 @@ impl Manager {
                     hosts: s.hosts.clone(),
                 })
                 .collect(),
+            auto_pause_minutes: record.spec.auto_pause_minutes,
+            paused_by,
+            paused_to_disk,
+            labels: record.spec.labels.clone(),
+            snapshot: record.spec.snapshot.clone(),
+            timeout: record.spec.timeout,
             created_at: record.created_at,
             error: entry.and_then(|l| l.error.clone()),
             forwards: entry
@@ -264,17 +281,30 @@ impl Manager {
         self.names()
             .iter()
             .filter_map(|n| Launch::load(&self.paths.vm_dir(n)))
-            .filter(|l| l.alive())
+            // A VM paused to disk comes back on its slot.
+            .filter(|l| l.present())
             .filter_map(|l| l.net)
             .collect()
     }
 
     /// The guest agent of a running VM. Counts as activity for idle stop; the idle
-    /// check itself uses [`Manager::running_guest`], which doesn't.
-    pub fn guest(&self, name: &str) -> Result<GuestAddr> {
-        let guest = self.running_guest(name)?;
+    /// check itself uses [`Manager::running_guest`], which doesn't. A VM its idle
+    /// timer paused is resumed first; one paused on purpose waits for `resume`.
+    pub async fn guest(self: &Arc<Self>, name: &str) -> Result<GuestAddr> {
+        self.record(name)?;
+        let launch = match Launch::load(&self.paths.vm_dir(name)) {
+            Some(l) if l.present() => l,
+            _ => bail!("VM {name:?} is not running"),
+        };
+        match launch.paused {
+            None => {}
+            Some(PauseReason::Idle) => {
+                self.resume(name).await?;
+            }
+            Some(_) => bail!("VM {name:?} is paused; resume it first (cove resume {name})"),
+        }
         self.touch(name);
-        Ok(guest)
+        Ok(launch.guest)
     }
 
     fn running_guest(&self, name: &str) -> Result<GuestAddr> {
@@ -316,20 +346,39 @@ impl Manager {
         }
     }
 
-    /// Stop running VMs whose idle timer ran out; returns their names. `minute` is
-    /// how long a minute of `idle_stop_minutes` lasts (shorter in tests).
-    pub async fn stop_idle(self: &Arc<Self>, minute: Duration) -> Vec<String> {
-        let mut stopped = Vec::new();
+    /// Pause or stop running VMs whose idle timer ran out, and act on timeouts that
+    /// are due. Returns what was done, as `(vm, "paused: idle")` and so on. `minute`
+    /// is how long a minute of the idle timers lasts (shorter in tests).
+    pub async fn check_timers(self: &Arc<Self>, minute: Duration) -> Vec<(String, String)> {
+        let mut done = Vec::new();
         for name in self.names() {
             let Ok(record) = self.record(&name) else {
                 continue;
             };
-            let Some(minutes) = record.spec.idle_stop_minutes else {
+            if let Some(timeout) = record.spec.timeout {
+                if crate::now() >= timeout.at {
+                    match self.fire_timeout(&name, timeout).await {
+                        Ok(what) => done.push((name.clone(), what)),
+                        Err(e) => eprintln!("{name}: its timeout failed: {e:#}"),
+                    }
+                    continue;
+                }
+            }
+            let (minutes, pause) = match (
+                record.spec.auto_pause_minutes,
+                record.spec.idle_stop_minutes,
+            ) {
+                (Some(m), _) => (m, true),
+                (None, Some(m)) => (m, false),
+                (None, None) => continue,
+            };
+            let Some(launch) = Launch::load(&self.paths.vm_dir(&name)).filter(|l| l.alive()) else {
                 continue;
             };
-            let Ok(guest) = self.running_guest(&name) else {
+            if launch.paused.is_some() {
                 continue;
-            };
+            }
+            let guest = launch.guest;
             // A VM nobody has touched since this server started counts from now.
             let (since, streams) = {
                 let mut activity = self.activity.lock().unwrap();
@@ -344,31 +393,343 @@ impl Manager {
                 continue;
             }
             // Only ask the guest once everything else says idle. If it doesn't
-            // answer, leave the VM alone rather than stop it blind.
-            let Ok(procs) = guest
-                .call_as::<Vec<cove_proto::ProcInfo>>(&Request::Procs)
-                .await
+            // answer, leave the VM alone rather than act blind.
+            let Ok(Ok(procs)) = tokio::time::timeout(
+                Duration::from_secs(10),
+                guest.call_as::<Vec<cove_proto::ProcInfo>>(&Request::Procs),
+            )
+            .await
             else {
                 continue;
             };
             let running = procs.iter().filter(|p| p.running).count();
-            if idle_expired(idle, since, streams, running) && self.stop(&name).await.is_ok() {
-                stopped.push(name);
+            if !idle_expired(idle, since, streams, running) {
+                continue;
+            }
+            if pause {
+                if self.pause(&name, PauseReason::Idle).await.is_ok() {
+                    done.push((name, "paused: idle".into()));
+                }
+            } else if self.stop(&name).await.is_ok() {
+                done.push((name, "stopped: idle".into()));
             }
         }
-        stopped
+        done
+    }
+
+    /// A VM's timeout is due: clear it (it is used once) and pause or delete.
+    async fn fire_timeout(self: &Arc<Self>, name: &str, timeout: Timeout) -> Result<String> {
+        {
+            let lock = self.lock(name).await;
+            let _guard = lock.lock().await;
+            let mut record = self.record(name)?;
+            record.spec.timeout = None;
+            self.save_record(&record)?;
+        }
+        match timeout.action {
+            TimeoutAction::Delete => {
+                self.delete(name).await?;
+                Ok("deleted: timeout".into())
+            }
+            TimeoutAction::Pause => {
+                let running = Launch::load(&self.paths.vm_dir(name)).is_some_and(|l| l.present());
+                if running {
+                    self.pause(name, PauseReason::Timeout).await?;
+                    Ok("paused: timeout".into())
+                } else {
+                    Ok("timeout passed while stopped".into())
+                }
+            }
+        }
+    }
+
+    /// Pause a running VM: memory and processes stay, and it uses no CPU until
+    /// resumed. Where the backend can, its memory goes to disk too, so a paused VM
+    /// costs only disk space.
+    pub async fn pause(self: &Arc<Self>, name: &str, reason: PauseReason) -> Result<VmStatus> {
+        let lock = self.lock(name).await;
+        let _guard = lock.lock().await;
+        let record = self.record(name)?;
+        let dir = self.paths.vm_dir(name);
+        let Some(mut launch) = Launch::load(&dir).filter(|l| l.present()) else {
+            bail!("VM {name:?} is not running");
+        };
+        if launch.paused.is_none() {
+            let mut on_disk = false;
+            if backend::can_save(&record) {
+                self.stop_egress(name).await;
+                let mut saved = launch.clone();
+                saved.paused = Some(reason);
+                match backend::save(&record, &dir, &mut saved).await {
+                    Ok(()) => {
+                        launch = saved;
+                        on_disk = true;
+                    }
+                    // Still running as it was: pause it in memory instead.
+                    Err(e) => {
+                        eprintln!("{name}: pausing in memory; saving it to disk failed: {e:#}")
+                    }
+                }
+            }
+            if !on_disk {
+                if let Err(e) = backend::pause(&record, &dir, &launch).await {
+                    drop(_guard);
+                    let _ = self.start_egress(name).await;
+                    return Err(e);
+                }
+            }
+        }
+        launch.paused = Some(reason);
+        launch.save(&dir)?;
+        drop(_guard);
+        self.status(name).await
+    }
+
+    /// Carry on with a paused VM; a running one is left as it is. A VM paused to disk
+    /// is restored first. If its saved memory can't be used, it boots again from its
+    /// disk instead: files are kept, processes are not.
+    pub async fn resume(self: &Arc<Self>, name: &str) -> Result<VmStatus> {
+        let lock = self.lock(name).await;
+        let _guard = lock.lock().await;
+        let record = self.record(name)?;
+        let dir = self.paths.vm_dir(name);
+        let Some(mut launch) = Launch::load(&dir).filter(|l| l.present()) else {
+            bail!("VM {name:?} is not running");
+        };
+        if launch.saved {
+            self.set_state(name, Some(VmState::Starting), None).await;
+            let restored = self.restore(&record, &dir, &mut launch).await;
+            let _ = std::fs::remove_dir_all(crate::chv::state_dir(&dir));
+            if let Err(e) = restored {
+                eprintln!("{name}: couldn't restore its memory, so it boots afresh: {e:#}");
+                if launch.alive() {
+                    backend::signal(launch.pid, libc::SIGKILL);
+                }
+                Launch::clear(&dir);
+                let booted = self.boot(&record, &dir).await;
+                if let Err(e) = booted {
+                    if let Some(l) = Launch::load(&dir) {
+                        backend::signal(l.pid, libc::SIGKILL);
+                        l.stop_helpers();
+                    }
+                    Launch::clear(&dir);
+                    self.set_state(name, None, Some(format!("{e:#}"))).await;
+                    return Err(e);
+                }
+                self.set_state(
+                    name,
+                    None,
+                    Some(format!(
+                        "resumed from its disk only, with a fresh boot: {e:#}"
+                    )),
+                )
+                .await;
+            } else {
+                self.set_state(name, None, None).await;
+            }
+            drop(_guard);
+            self.start_egress(name).await?;
+            self.touch(name);
+            return self.status(name).await;
+        }
+        if launch.paused.is_some() {
+            backend::resume(&record, &dir, &launch).await?;
+            launch.paused = None;
+            launch.save(&dir)?;
+        }
+        drop(_guard);
+        self.touch(name);
+        self.status(name).await
+    }
+
+    /// Bring a VM paused to disk back, and wait for its agent.
+    async fn restore(&self, record: &VmRecord, dir: &Path, launch: &mut Launch) -> Result<()> {
+        backend::restore(record, dir, launch).await?;
+        launch.paused = None;
+        launch.save(dir)?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(Ok(_)) =
+                tokio::time::timeout(Duration::from_secs(2), launch.guest.ping()).await
+            {
+                if record.spec.backend == backend::CLOUD_HYPERVISOR {
+                    backend::remount_all(record, launch).await;
+                }
+                return Ok(());
+            }
+            if !launch.alive() || tokio::time::Instant::now() > deadline {
+                bail!("the guest agent didn't answer after restoring");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Change labels, idle timers or the timeout.
+    pub async fn update(&self, name: &str, update: VmUpdate) -> Result<VmStatus> {
+        let lock = self.lock(name).await;
+        let _guard = lock.lock().await;
+        let mut record = self.record(name)?;
+        if let Some(labels) = update.labels {
+            crate::model::check_labels(&labels).map_err(anyhow::Error::msg)?;
+            record.spec.labels = labels;
+        }
+        if let Some(m) = update.auto_pause_minutes {
+            check_minutes(m, "auto pause")?;
+            record.spec.auto_pause_minutes = m;
+        }
+        if let Some(m) = update.idle_stop_minutes {
+            check_minutes(m, "idle stop")?;
+            record.spec.idle_stop_minutes = m;
+        }
+        if let Some(t) = update.timeout {
+            record.spec.timeout = match t {
+                Some(t) => Some(
+                    t.resolve(crate::now(), crate::minute_secs())
+                        .map_err(anyhow::Error::msg)?,
+                ),
+                None => None,
+            };
+        }
+        self.save_record(&record)?;
+        // A new timer counts from now.
+        self.touch(name);
+        drop(_guard);
+        self.status(name).await
+    }
+
+    /// Give a stopped VM a new name. Its disk, settings and snapshots stay.
+    pub async fn rename(&self, from: &str, to: &str) -> Result<VmStatus> {
+        if !crate::valid_name(to) {
+            bail!("VM names use lowercase letters, digits and dashes (max 40)");
+        }
+        let lock = self.lock(from).await;
+        let _guard = lock.lock().await;
+        let mut record = self.record(from)?;
+        let dir = self.paths.vm_dir(from);
+        if Launch::load(&dir).is_some_and(|l| l.present()) {
+            bail!("stop {from:?} before renaming it");
+        }
+        let target = self.paths.vm_dir(to);
+        if target.exists() {
+            bail!("a VM named {to:?} already exists");
+        }
+        crate::gvisor::release_mounts(&dir);
+        std::fs::rename(&dir, &target)?;
+        record.spec.name = to.to_string();
+        // A new instance id has cloud-init give the VM its new host name.
+        record.instance_id = format!("{to}-{}", crate::random_hex(6));
+        self.save_record(&record)?;
+        self.live.lock().await.remove(from);
+        self.activity.lock().unwrap().remove(from);
+        drop(_guard);
+        self.status(to).await
+    }
+
+    /// Save a VM's disk (or root filesystem) as a snapshot named `snap`. A running VM
+    /// is synced and frozen while its disk is copied, then carries on; what programs
+    /// haven't written yet is left out, as after a power cut.
+    pub async fn save_snapshot(
+        self: &Arc<Self>,
+        name: &str,
+        snap: &str,
+        description: &str,
+    ) -> Result<SnapshotInfo> {
+        if !crate::valid_name(snap) {
+            bail!("snapshot names use lowercase letters, digits and dashes (max 40)");
+        }
+        let target = self.paths.snapshot_dir(snap);
+        if target.exists() {
+            bail!("a snapshot named {snap:?} already exists; remove it first");
+        }
+        let lock = self.lock(name).await;
+        let _guard = lock.lock().await;
+        let record = self.record(name)?;
+        let dir = self.paths.vm_dir(name);
+        let kind = snapshot::Kind::for_backend(&record.spec.backend);
+        let launch = Launch::load(&dir).filter(|l| l.present());
+        let mut froze = None;
+        if let Some(l) = &launch {
+            if l.paused.is_none() {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(60),
+                    l.guest.exec(cove_proto::Command {
+                        cmd: vec!["sync".into()],
+                        ..Default::default()
+                    }),
+                )
+                .await;
+                backend::pause(&record, &dir, l).await?;
+                froze = Some(l.clone());
+            }
+        }
+        let tmp = self.paths.snapshots().join(format!(".{snap}.tmp"));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let copied = (|| -> Result<u64> {
+            std::fs::create_dir_all(&tmp)?;
+            let from = match kind {
+                snapshot::Kind::Disk => dir.join("disk.raw"),
+                snapshot::Kind::Rootfs => crate::gvisor::rootfs(&dir),
+                snapshot::Kind::Host => dir.join("root"),
+            };
+            let to = snapshot::data_path(&tmp, kind);
+            snapshot::copy_data(kind, &from, &to)?;
+            Ok(match kind {
+                snapshot::Kind::Disk => crate::disk::allocated(&to),
+                _ => crate::disk::allocated_tree(&to),
+            })
+        })();
+        if let Some(l) = &froze {
+            if let Err(e) = backend::resume(&record, &dir, l).await {
+                eprintln!("{name}: could not resume after the snapshot: {e:#}");
+            }
+        }
+        let size = match copied {
+            Ok(size) => size,
+            Err(e) => {
+                crate::gvisor::release_mounts(&tmp);
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(e);
+            }
+        };
+        let info = SnapshotInfo {
+            name: snap.to_string(),
+            description: description.to_string(),
+            kind,
+            arch: crate::image::rust_arch().to_string(),
+            image: record.spec.image.clone(),
+            source_vm: name.to_string(),
+            disk_gb: record.spec.disk_gb,
+            created_at: crate::now(),
+            size,
+        };
+        std::fs::write(tmp.join("snapshot.json"), serde_json::to_vec_pretty(&info)?)?;
+        std::fs::rename(&tmp, &target)?;
+        Ok(info)
     }
 
     pub async fn create(self: &Arc<Self>, spec: VmSpec, start: bool) -> Result<VmStatus> {
         if !crate::valid_name(&spec.name) {
             bail!("VM names use lowercase letters, digits and dashes (max 40)");
         }
-        if spec.idle_stop_minutes == Some(0) {
-            bail!("idle stop takes at least 1 minute");
+        check_minutes(spec.idle_stop_minutes, "idle stop")?;
+        check_minutes(spec.auto_pause_minutes, "auto pause")?;
+        crate::model::check_labels(&spec.labels).map_err(anyhow::Error::msg)?;
+        if spec.timeout.is_some_and(|t| t.at <= crate::now()) {
+            bail!("the timeout is already past");
         }
         let mut spec = spec;
         prepare_egress(&mut spec)?;
         let backend = backend::resolve(&spec.backend)?;
+        let snap = match &spec.snapshot {
+            Some(s) => {
+                let snap = snapshot::load(&self.paths, s)?;
+                snapshot::check_fits(&snap, backend)?;
+                spec.image = snap.image.clone();
+                spec.disk_gb = spec.disk_gb.max(snap.disk_gb);
+                Some(snap)
+            }
+            None => None,
+        };
         backend::check(backend).map_err(|e| anyhow!(e))?;
         if backend == backend::HOST
             && !spec.mounts.is_empty()
@@ -393,7 +754,21 @@ impl Manager {
         if dir.join("vm.json").exists() {
             bail!("a VM named {:?} already exists", spec.name);
         }
-        if backend == backend::GVISOR {
+        if let Some(snap) = &snap {
+            std::fs::create_dir_all(&dir)?;
+            let data = snapshot::data_path(&self.paths.snapshot_dir(&snap.name), snap.kind);
+            let made = match snap.kind {
+                snapshot::Kind::Disk => clone_disk(&data, &dir.join("disk.raw"), spec.disk_gb),
+                snapshot::Kind::Rootfs => {
+                    snapshot::copy_data(snap.kind, &data, &crate::gvisor::rootfs(&dir))
+                }
+                snapshot::Kind::Host => snapshot::copy_data(snap.kind, &data, &dir.join("root")),
+            };
+            if let Err(e) = made {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(e);
+            }
+        } else if backend == backend::GVISOR {
             let base = image::rootfs_path(&self.paths, &spec.image);
             if !base.is_dir() {
                 bail!(
@@ -438,9 +813,15 @@ impl Manager {
         let _guard = lock.lock().await;
         let record = self.record(name)?;
         let dir = self.paths.vm_dir(name);
-        if Launch::load(&dir).is_some_and(|l| l.alive()) {
-            drop(_guard);
-            return self.status(name).await;
+        if let Some(l) = Launch::load(&dir) {
+            if l.saved {
+                drop(_guard);
+                return self.resume(name).await;
+            }
+            if l.alive() {
+                drop(_guard);
+                return self.status(name).await;
+            }
         }
         self.set_state(name, Some(VmState::Starting), None).await;
         let mut result = self.boot(&record, &dir).await;
@@ -664,7 +1045,7 @@ impl Manager {
     }
 
     /// Start the proxies of VMs that kept running while the server was down.
-    pub async fn resume(self: &Arc<Self>) {
+    pub async fn restart_proxies(self: &Arc<Self>) {
         for name in self.names() {
             if self.running_guest(&name).is_ok() {
                 if let Err(e) = self.start_egress(&name).await {
@@ -734,6 +1115,14 @@ impl Manager {
         self.close_forwards(name).await;
         self.stop_egress(name).await;
         if let Some(launch) = Launch::load(&dir) {
+            // Paused to disk: there is no process; stopping drops its saved memory.
+            let _ = std::fs::remove_dir_all(crate::chv::state_dir(&dir));
+            if launch.alive() && launch.paused.is_some() {
+                // A frozen VM can't shut itself down.
+                if let Err(e) = backend::resume(&record, &dir, &launch).await {
+                    eprintln!("{name}: could not resume it to stop it: {e:#}");
+                }
+            }
             if launch.alive() {
                 self.set_state(name, Some(VmState::Stopping), None).await;
                 if record.spec.backend == backend::GVISOR {
@@ -781,7 +1170,7 @@ impl Manager {
     pub async fn delete(self: &Arc<Self>, name: &str) -> Result<()> {
         self.record(name)?;
         let dir = self.paths.vm_dir(name);
-        if Launch::load(&dir).is_some_and(|l| l.alive()) {
+        if Launch::load(&dir).is_some_and(|l| l.present()) {
             let _ = Box::pin(self.stop_no_delete(name)).await;
         }
         let lock = self.lock(name).await;
@@ -812,7 +1201,7 @@ impl Manager {
         }
         let src = self.record(from)?;
         let src_dir = self.paths.vm_dir(from);
-        if Launch::load(&src_dir).is_some_and(|l| l.alive()) {
+        if Launch::load(&src_dir).is_some_and(|l| l.present()) {
             bail!("stop {from:?} before copying it");
         }
         let dir = self.paths.vm_dir(to);
@@ -821,7 +1210,12 @@ impl Manager {
         }
         std::fs::create_dir_all(&dir)?;
         if src_dir.join("disk.raw").is_file() {
-            std::fs::copy(src_dir.join("disk.raw"), dir.join("disk.raw"))?;
+            if let Err(e) =
+                crate::disk::copy_sparse(&src_dir.join("disk.raw"), &dir.join("disk.raw"))
+            {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(e);
+            }
         }
         let rootfs = crate::gvisor::rootfs(&src_dir);
         if rootfs.is_dir() {
@@ -838,13 +1232,13 @@ impl Manager {
         self.status(to).await
     }
 
-    pub async fn ports(&self, name: &str) -> Result<Vec<cove_proto::ListeningPort>> {
-        self.guest(name)?.call_as(&Request::Ports).await
+    pub async fn ports(self: &Arc<Self>, name: &str) -> Result<Vec<cove_proto::ListeningPort>> {
+        self.guest(name).await?.call_as(&Request::Ports).await
     }
 
     /// Forward a guest port to a host port on 127.0.0.1, reusing an existing forward.
     pub async fn forward(self: &Arc<Self>, name: &str, guest_port: u16) -> Result<Forward> {
-        let guest = self.guest(name)?;
+        let guest = self.guest(name).await?;
         let mut live = self.live.lock().await;
         let entry = live.entry(name.to_string()).or_default();
         if let Some((f, _)) = entry
@@ -860,9 +1254,10 @@ impl Manager {
         let vm = name.to_string();
         let task = tokio::spawn(async move {
             while let Ok((mut conn, _)) = listener.accept().await {
-                // Someone looking at a preview is using the VM.
+                // Someone looking at a preview is using the VM, and wakes it
+                // when its idle timer paused it.
                 if let Some(m) = manager.upgrade() {
-                    m.touch(&vm);
+                    let _ = m.guest(&vm).await;
                 }
                 let guest = guest.clone();
                 tokio::spawn(async move {
@@ -902,6 +1297,14 @@ impl Manager {
             }
         }
     }
+}
+
+/// Idle timers take at least a minute; `None` means no timer.
+fn check_minutes(minutes: Option<u64>, what: &str) -> Result<()> {
+    if minutes == Some(0) {
+        bail!("{what} takes at least 1 minute (leave it out, or null, for none)");
+    }
+    Ok(())
 }
 
 /// Keeps a stream counted as open; see [`Manager::stream_opened`].
@@ -1000,7 +1403,7 @@ async fn open_pipe(guest: &GuestAddr, request: &Request) -> Result<crate::guest:
 /// Clone the base disk (APFS clone on macOS, reflink on btrfs/XFS via
 /// `copy_file_range`, a plain copy elsewhere) and grow it to `disk_gb`.
 fn clone_disk(base: &Path, target: &Path, disk_gb: u64) -> Result<()> {
-    std::fs::copy(base, target).with_context(|| format!("copying {}", base.display()))?;
+    crate::disk::copy_sparse(base, target)?;
     crate::paths::restrict(target, 0o600);
     let want = disk_gb * 1024 * 1024 * 1024;
     let file = std::fs::OpenOptions::new().write(true).open(target)?;
