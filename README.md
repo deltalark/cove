@@ -40,7 +40,7 @@ Coding agents are most useful when you let them run commands freely, and most da
 - **Real isolation.** A VM sees only the folders you share. Commands an agent runs there can't touch your home folder, keychain or SSH keys. Turn its network off entirely for code you don't trust.
 - **Keys never enter the VM.** Give a VM your API keys and tokens as secrets: inside, it sees only placeholders, and Cove's proxy adds the real values to HTTPS requests for the hosts each secret belongs to. An agent can't leak what it never had.
 - **Only the hosts you allow.** With `--network allowlist` a VM has no network device at all and reaches only the hosts on its list, through Cove's proxy. Every connection it tries is logged, so you can see what an agent reached and what was blocked.
-- **Pause, resume, and pause by itself.** `cove pause` freezes a VM with its memory and running processes kept, and `cove resume` carries on where it left off. With `--auto-pause` a VM pauses once it has been idle for a while, and the next command, stream or visit to a forwarded port wakes it. Timeouts pause or delete a VM at a set time.
+- **Pause, resume, and pause by itself.** `cove pause` freezes a VM with its memory and running processes kept, and `cove resume` carries on where it left off. On a KVM server the memory goes to disk, so a paused VM uses no RAM at all, and pausing or resuming takes about a second. With `--auto-pause` a VM pauses once it has been idle for a while, and the next command, stream or visit to a forwarded port wakes it. Timeouts pause or delete a VM at a set time.
 - **Snapshots.** Save a VM, even while it runs, and start new VMs from it: set a project up once (`cove snapshot build`) and every VM after that starts ready.
 - **Easy to connect.** `cove pair` prints a one-time code that Runo or another computer trades for a key of its own, and `/v1/settings` holds the server's defaults for new VMs, so Runo can show and change them.
 
@@ -200,7 +200,7 @@ Every request carries `Authorization: Bearer <key>`: the server's own key, creat
 
 The stream's frames and requests are the types in [`crates/proto`](crates/proto/src/lib.rs).
 
-A VM's `state` is `stopped`, `starting`, `running`, `stopping` or `paused`. A paused one says why in `paused_by`: `user`, `idle` (the next request resumes it) or `timeout`. Requests to a VM paused by a person or a timeout get a 409 until it is resumed.
+A VM's `state` is `stopped`, `starting`, `running`, `stopping` or `paused`. A paused one has `paused_to_disk: true` when its memory was written to disk (cloud-hypervisor VMs without shared folders; it then holds no RAM, and survives a server restart), and says why in `paused_by`: `user`, `idle` (the next request resumes it) or `timeout`. Requests to a VM paused by a person or a timeout get a 409 until it is resumed.
 
 A VM's `backend` is `"auto"` (the default) or a backend's name, `network` is `"full"` (the default), `"off"` or `"allowlist"`, and `idle_stop_minutes` is a whole number of minutes, or left out for no timer. All three come back in every VM's status, `backend` as the one it got.
 
@@ -343,7 +343,7 @@ Cove is early, but the core is here.
 
 **Next**
 
-- [ ] Pause to disk, so a paused VM frees its memory too (cloud-hypervisor snapshots, `runsc checkpoint`)
+- [ ] Pause to disk for VMs with shared folders, and on gVisor (`runsc checkpoint`); today those pause in memory
 - [ ] SSH from any terminal: a gateway with keys and paste-anywhere tokens
 - [ ] Public HTTPS ports on your own domain, with wake on visit
 - [ ] Secrets stored on the server and changeable on a running VM

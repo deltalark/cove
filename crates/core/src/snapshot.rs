@@ -75,6 +75,10 @@ pub fn data_path(dir: &Path, kind: Kind) -> PathBuf {
 }
 
 pub fn load(paths: &Paths, name: &str) -> Result<SnapshotInfo> {
+    // Names come from URLs: never let one reach outside snapshots/.
+    if !crate::valid_name(name) {
+        bail!("no snapshot named {name:?}");
+    }
     let text = std::fs::read_to_string(info_path(paths, name))
         .map_err(|_| anyhow!("no snapshot named {name:?}"))?;
     Ok(serde_json::from_str(&text)?)
@@ -179,5 +183,6 @@ mod tests {
         assert_eq!(list(&paths)[0].name, "base");
         remove(&paths, "base").unwrap();
         assert!(load(&paths, "base").is_err());
+        assert!(remove(&paths, "../vms").is_err());
     }
 }

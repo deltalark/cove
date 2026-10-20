@@ -1194,3 +1194,29 @@ fn pairing_gives_a_named_key() {
     let made = s.json(&["keys", "create", "ci"]);
     assert!(made["key"].as_str().unwrap().starts_with("cove_"));
 }
+
+#[test]
+fn names_from_urls_stay_inside_cove_folders() {
+    let s = start_server();
+    let key = std::fs::read_to_string(s.home.path().join("api-key")).unwrap();
+    std::fs::create_dir_all(s.home.path().join("keep")).unwrap();
+    for path in ["/v1/snapshots/..%2Fkeep", "/v1/vms/..%2Fkeep"] {
+        let out = Command::new("curl")
+            .args([
+                "-s",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "-X",
+                "DELETE",
+                "-H",
+            ])
+            .arg(format!("Authorization: Bearer {}", key.trim()))
+            .arg(format!("{}{path}", s.url))
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "404", "{path}");
+    }
+    assert!(s.home.path().join("keep").is_dir());
+}

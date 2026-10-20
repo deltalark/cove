@@ -179,6 +179,10 @@ impl Manager {
     }
 
     fn record(&self, name: &str) -> Result<VmRecord> {
+        // Names come from URLs: never let one reach outside vms/.
+        if !crate::valid_name(name) {
+            bail!("no VM named {name:?}");
+        }
         let path = self.paths.vm_dir(name).join("vm.json");
         let text = std::fs::read_to_string(&path).map_err(|_| anyhow!("no VM named {name:?}"))?;
         Ok(serde_json::from_str(&text)?)
