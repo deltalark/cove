@@ -280,17 +280,60 @@ pub async fn resume(vm_dir: &Path) -> Result<()> {
 
 /// `PUT /api/v1/<action>` on the VM's API socket.
 async fn api_put(vm_dir: &Path, action: &str) -> Result<()> {
+    api_put_body(vm_dir, action, None).await
+}
+
+async fn api_put_body(vm_dir: &Path, action: &str, body: Option<&str>) -> Result<()> {
     let status = crate::backend::unix_http(
         &vm_dir.join("api.sock"),
         "PUT",
         &format!("/api/v1/{action}"),
-        None,
+        body,
     )
     .await?;
     if !(200..300).contains(&status.0) {
         bail!("cloud-hypervisor {action}: {}", status.1);
     }
     Ok(())
+}
+
+/// Where a VM paused to disk keeps its memory and device state.
+pub fn state_dir(vm_dir: &Path) -> std::path::PathBuf {
+    vm_dir.join("state")
+}
+
+/// Whether a VM can be paused to disk. cloud-hypervisor can't snapshot vhost-user
+/// devices, which is what shared folders (virtio-fs) are, so those VMs pause in
+/// memory instead.
+pub fn can_save(record: &VmRecord) -> bool {
+    record.spec.mounts.is_empty()
+}
+
+/// Write a paused VM's memory and devices to [`state_dir`].
+pub async fn save(vm_dir: &Path) -> Result<()> {
+    let state = state_dir(vm_dir);
+    let _ = std::fs::remove_dir_all(&state);
+    std::fs::create_dir_all(&state)?;
+    crate::paths::restrict(&state, 0o700);
+    let body =
+        serde_json::json!({ "destination_url": format!("file://{}", state.display()) }).to_string();
+    // Writing out the memory takes a while for a big VM.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        api_put_body(vm_dir, "vm.snapshot", Some(&body)),
+    )
+    .await
+    .context("saving the VM's memory took too long")?
+}
+
+/// The command line that brings a saved VM back (paused; `resume` starts it).
+pub fn restore_args(vm_dir: &Path) -> Vec<String> {
+    vec![
+        "--api-socket".into(),
+        format!("path={}", vm_dir.join("api.sock").display()),
+        "--restore".into(),
+        format!("source_url=file://{}", state_dir(vm_dir).display()),
+    ]
 }
 
 /// Whether this process may create tap devices and change iptables.

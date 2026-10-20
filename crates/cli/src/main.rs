@@ -688,7 +688,11 @@ fn print_vms(vms: &[VmStatus]) {
                     "paused by its timeout; cove resume wakes it"
                 }
             };
-            println!("  {why}");
+            if vm.paused_to_disk {
+                println!("  {why} (its memory is on disk, so it uses no RAM)");
+            } else {
+                println!("  {why}");
+            }
         }
         if let Some(e) = &vm.error {
             println!("  error: {e}");

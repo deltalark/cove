@@ -353,6 +353,7 @@ pub fn launch(
                 helpers: vec![],
                 net: net.map(|n| n.0),
                 paused: None,
+                saved: false,
             });
         }
         last_error = format!("runsc couldn't start the sandbox on the {platform} platform");

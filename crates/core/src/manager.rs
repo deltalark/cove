@@ -216,8 +216,9 @@ impl Manager {
     pub async fn status(&self, name: &str) -> Result<VmStatus> {
         let record = self.record(name)?;
         let dir = self.paths.vm_dir(name);
-        let launch = Launch::load(&dir).filter(|l| l.alive());
+        let launch = Launch::load(&dir).filter(|l| l.present());
         let paused_by = launch.as_ref().and_then(|l| l.paused);
+        let paused_to_disk = launch.as_ref().is_some_and(|l| l.saved);
         let live = self.live.lock().await;
         let entry = live.get(name);
         let state = match entry.and_then(|l| l.state) {
@@ -252,6 +253,7 @@ impl Manager {
                 .collect(),
             auto_pause_minutes: record.spec.auto_pause_minutes,
             paused_by,
+            paused_to_disk,
             labels: record.spec.labels.clone(),
             snapshot: record.spec.snapshot.clone(),
             timeout: record.spec.timeout,
@@ -275,7 +277,8 @@ impl Manager {
         self.names()
             .iter()
             .filter_map(|n| Launch::load(&self.paths.vm_dir(n)))
-            .filter(|l| l.alive())
+            // A VM paused to disk comes back on its slot.
+            .filter(|l| l.present())
             .filter_map(|l| l.net)
             .collect()
     }
@@ -283,10 +286,10 @@ impl Manager {
     /// The guest agent of a running VM. Counts as activity for idle stop; the idle
     /// check itself uses [`Manager::running_guest`], which doesn't. A VM its idle
     /// timer paused is resumed first; one paused on purpose waits for `resume`.
-    pub async fn guest(&self, name: &str) -> Result<GuestAddr> {
+    pub async fn guest(self: &Arc<Self>, name: &str) -> Result<GuestAddr> {
         self.record(name)?;
         let launch = match Launch::load(&self.paths.vm_dir(name)) {
-            Some(l) if l.alive() => l,
+            Some(l) if l.present() => l,
             _ => bail!("VM {name:?} is not running"),
         };
         match launch.paused {
@@ -425,7 +428,7 @@ impl Manager {
                 Ok("deleted: timeout".into())
             }
             TimeoutAction::Pause => {
-                let running = Launch::load(&self.paths.vm_dir(name)).is_some_and(|l| l.alive());
+                let running = Launch::load(&self.paths.vm_dir(name)).is_some_and(|l| l.present());
                 if running {
                     self.pause(name, PauseReason::Timeout).await?;
                     Ok("paused: timeout".into())
@@ -436,17 +439,32 @@ impl Manager {
         }
     }
 
-    /// Freeze a running VM. Memory and processes stay; it uses no CPU until resumed.
+    /// Pause a running VM: memory and processes stay, and it uses no CPU until
+    /// resumed. Where the backend can, its memory goes to disk too, so a paused VM
+    /// costs only disk space.
     pub async fn pause(self: &Arc<Self>, name: &str, reason: PauseReason) -> Result<VmStatus> {
         let lock = self.lock(name).await;
         let _guard = lock.lock().await;
         let record = self.record(name)?;
         let dir = self.paths.vm_dir(name);
-        let Some(mut launch) = Launch::load(&dir).filter(|l| l.alive()) else {
+        let Some(mut launch) = Launch::load(&dir).filter(|l| l.present()) else {
             bail!("VM {name:?} is not running");
         };
         if launch.paused.is_none() {
             backend::pause(&record, &dir, &launch).await?;
+            launch.paused = Some(reason);
+            launch.save(&dir)?;
+            if backend::can_save(&record) {
+                self.stop_egress(name).await;
+                let mut saved = launch.clone();
+                match backend::save(&record, &dir, &mut saved).await {
+                    Ok(()) => launch = saved,
+                    // Still paused, in memory: nothing is lost.
+                    Err(e) => {
+                        eprintln!("{name}: paused in memory; saving it to disk failed: {e:#}")
+                    }
+                }
+            }
         }
         launch.paused = Some(reason);
         launch.save(&dir)?;
@@ -454,15 +472,53 @@ impl Manager {
         self.status(name).await
     }
 
-    /// Unfreeze a paused VM; a running one is left as it is.
-    pub async fn resume(&self, name: &str) -> Result<VmStatus> {
+    /// Carry on with a paused VM; a running one is left as it is. A VM paused to disk
+    /// is restored first. If its saved memory can't be used, it boots again from its
+    /// disk instead: files are kept, processes are not.
+    pub async fn resume(self: &Arc<Self>, name: &str) -> Result<VmStatus> {
         let lock = self.lock(name).await;
         let _guard = lock.lock().await;
         let record = self.record(name)?;
         let dir = self.paths.vm_dir(name);
-        let Some(mut launch) = Launch::load(&dir).filter(|l| l.alive()) else {
+        let Some(mut launch) = Launch::load(&dir).filter(|l| l.present()) else {
             bail!("VM {name:?} is not running");
         };
+        if launch.saved {
+            self.set_state(name, Some(VmState::Starting), None).await;
+            let restored = self.restore(&record, &dir, &mut launch).await;
+            let _ = std::fs::remove_dir_all(crate::chv::state_dir(&dir));
+            if let Err(e) = restored {
+                eprintln!("{name}: couldn't restore its memory, so it boots afresh: {e:#}");
+                if launch.alive() {
+                    backend::signal(launch.pid, libc::SIGKILL);
+                }
+                Launch::clear(&dir);
+                let booted = self.boot(&record, &dir).await;
+                if let Err(e) = booted {
+                    if let Some(l) = Launch::load(&dir) {
+                        backend::signal(l.pid, libc::SIGKILL);
+                        l.stop_helpers();
+                    }
+                    Launch::clear(&dir);
+                    self.set_state(name, None, Some(format!("{e:#}"))).await;
+                    return Err(e);
+                }
+                self.set_state(
+                    name,
+                    None,
+                    Some(format!(
+                        "resumed from its disk only, with a fresh boot: {e:#}"
+                    )),
+                )
+                .await;
+            } else {
+                self.set_state(name, None, None).await;
+            }
+            drop(_guard);
+            self.start_egress(name).await?;
+            self.touch(name);
+            return self.status(name).await;
+        }
         if launch.paused.is_some() {
             backend::resume(&record, &dir, &launch).await?;
             launch.paused = None;
@@ -471,6 +527,26 @@ impl Manager {
         drop(_guard);
         self.touch(name);
         self.status(name).await
+    }
+
+    /// Bring a VM paused to disk back, and wait for its agent.
+    async fn restore(&self, record: &VmRecord, dir: &Path, launch: &mut Launch) -> Result<()> {
+        backend::restore(record, dir, launch).await?;
+        backend::resume(record, dir, launch).await?;
+        launch.paused = None;
+        launch.save(dir)?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(Ok(_)) =
+                tokio::time::timeout(Duration::from_secs(2), launch.guest.ping()).await
+            {
+                return Ok(());
+            }
+            if !launch.alive() || tokio::time::Instant::now() > deadline {
+                bail!("the guest agent didn't answer after restoring");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     /// Change labels, idle timers or the timeout.
@@ -515,7 +591,7 @@ impl Manager {
         let _guard = lock.lock().await;
         let mut record = self.record(from)?;
         let dir = self.paths.vm_dir(from);
-        if Launch::load(&dir).is_some_and(|l| l.alive()) {
+        if Launch::load(&dir).is_some_and(|l| l.present()) {
             bail!("stop {from:?} before renaming it");
         }
         let target = self.paths.vm_dir(to);
@@ -555,7 +631,7 @@ impl Manager {
         let record = self.record(name)?;
         let dir = self.paths.vm_dir(name);
         let kind = snapshot::Kind::for_backend(&record.spec.backend);
-        let launch = Launch::load(&dir).filter(|l| l.alive());
+        let launch = Launch::load(&dir).filter(|l| l.present());
         let mut froze = None;
         if let Some(l) = &launch {
             if l.paused.is_none() {
@@ -722,9 +798,15 @@ impl Manager {
         let _guard = lock.lock().await;
         let record = self.record(name)?;
         let dir = self.paths.vm_dir(name);
-        if Launch::load(&dir).is_some_and(|l| l.alive()) {
-            drop(_guard);
-            return self.status(name).await;
+        if let Some(l) = Launch::load(&dir) {
+            if l.saved {
+                drop(_guard);
+                return self.resume(name).await;
+            }
+            if l.alive() {
+                drop(_guard);
+                return self.status(name).await;
+            }
         }
         self.set_state(name, Some(VmState::Starting), None).await;
         let mut result = self.boot(&record, &dir).await;
@@ -1018,6 +1100,8 @@ impl Manager {
         self.close_forwards(name).await;
         self.stop_egress(name).await;
         if let Some(launch) = Launch::load(&dir) {
+            // Paused to disk: there is no process; stopping drops its saved memory.
+            let _ = std::fs::remove_dir_all(crate::chv::state_dir(&dir));
             if launch.alive() && launch.paused.is_some() {
                 // A frozen VM can't shut itself down.
                 if let Err(e) = backend::resume(&record, &dir, &launch).await {
@@ -1071,7 +1155,7 @@ impl Manager {
     pub async fn delete(self: &Arc<Self>, name: &str) -> Result<()> {
         self.record(name)?;
         let dir = self.paths.vm_dir(name);
-        if Launch::load(&dir).is_some_and(|l| l.alive()) {
+        if Launch::load(&dir).is_some_and(|l| l.present()) {
             let _ = Box::pin(self.stop_no_delete(name)).await;
         }
         let lock = self.lock(name).await;
@@ -1102,7 +1186,7 @@ impl Manager {
         }
         let src = self.record(from)?;
         let src_dir = self.paths.vm_dir(from);
-        if Launch::load(&src_dir).is_some_and(|l| l.alive()) {
+        if Launch::load(&src_dir).is_some_and(|l| l.present()) {
             bail!("stop {from:?} before copying it");
         }
         let dir = self.paths.vm_dir(to);
@@ -1133,7 +1217,7 @@ impl Manager {
         self.status(to).await
     }
 
-    pub async fn ports(&self, name: &str) -> Result<Vec<cove_proto::ListeningPort>> {
+    pub async fn ports(self: &Arc<Self>, name: &str) -> Result<Vec<cove_proto::ListeningPort>> {
         self.guest(name).await?.call_as(&Request::Ports).await
     }
 

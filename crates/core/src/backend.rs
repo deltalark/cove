@@ -161,6 +161,9 @@ pub struct Launch {
     /// Set while the VM is frozen, and why. Kept here so a restarted server knows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused: Option<PauseReason>,
+    /// Paused to disk: its memory is in `state/` and no process runs (`pid` is 0).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub saved: bool,
 }
 
 impl Launch {
@@ -178,8 +181,14 @@ impl Launch {
         let _ = std::fs::remove_file(vm_dir.join("run.json"));
     }
 
+    /// Whether its process runs. A VM paused to disk has none.
     pub fn alive(&self) -> bool {
-        pid_alive(self.pid)
+        self.pid != 0 && pid_alive(self.pid)
+    }
+
+    /// Running, or paused to disk: the VM exists past a stop.
+    pub fn present(&self) -> bool {
+        self.saved || self.alive()
     }
 
     /// Clean up after the VM: stop helpers (they exit by themselves when the VM does,
@@ -310,6 +319,7 @@ pub fn launch(record: &VmRecord, vm_dir: &Path, opts: &LaunchOptions) -> Result<
                 helpers: vec![],
                 net: None,
                 paused: None,
+                saved: false,
             }
         }
         VFKIT => {
@@ -328,6 +338,7 @@ pub fn launch(record: &VmRecord, vm_dir: &Path, opts: &LaunchOptions) -> Result<
                 helpers: vec![],
                 net: None,
                 paused: None,
+                saved: false,
             }
         }
         CLOUD_HYPERVISOR => {
@@ -379,6 +390,7 @@ pub fn launch(record: &VmRecord, vm_dir: &Path, opts: &LaunchOptions) -> Result<
                 helpers,
                 net: net.map(|n| n.0),
                 paused: None,
+                saved: false,
             }
         }
         GVISOR => {
@@ -417,6 +429,81 @@ pub async fn resume(record: &VmRecord, vm_dir: &Path, launch: &Launch) -> Result
         GVISOR => crate::gvisor::resume(&record.spec.name, vm_dir)?,
         other => bail!("{other} can't resume VMs"),
     }
+    Ok(())
+}
+
+/// Whether this VM can be paused to disk, freeing its memory.
+pub fn can_save(record: &VmRecord) -> bool {
+    match record.spec.backend.as_str() {
+        CLOUD_HYPERVISOR => crate::chv::can_save(record),
+        _ => false,
+    }
+}
+
+/// Write a paused VM's memory to disk and end its process. `launch` becomes saved.
+pub async fn save(record: &VmRecord, vm_dir: &Path, launch: &mut Launch) -> Result<()> {
+    match record.spec.backend.as_str() {
+        CLOUD_HYPERVISOR => crate::chv::save(vm_dir).await?,
+        other => bail!("{other} can't pause VMs to disk"),
+    }
+    signal(launch.pid, libc::SIGKILL);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while pid_alive(launch.pid) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    crate::chv::stop_helpers(&launch.helpers);
+    launch.helpers.clear();
+    launch.pid = 0;
+    launch.saved = true;
+    Ok(())
+}
+
+/// Start a VM paused to disk again, from where it was. It comes back paused; the
+/// caller resumes it.
+pub async fn restore(record: &VmRecord, vm_dir: &Path, launch: &mut Launch) -> Result<()> {
+    match record.spec.backend.as_str() {
+        CLOUD_HYPERVISOR => {
+            let program = which("cloud-hypervisor")
+                .context("cloud-hypervisor is not installed (see cove doctor)")?;
+            if record.spec.network == Network::Full {
+                crate::chv::setup_nat()?;
+            }
+            for stale in ["vsock.sock", "api.sock"] {
+                let _ = std::fs::remove_file(vm_dir.join(stale));
+            }
+            let log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(vm_dir.join("backend.log"))?;
+            let mut cmd = std::process::Command::new(&program);
+            cmd.args(crate::chv::restore_args(vm_dir))
+                .stdout(log.try_clone()?)
+                .stderr(log);
+            let pid = spawn_detached(cmd)?;
+            // Wait for its API, which answers once the memory is loaded.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            loop {
+                if !pid_alive(pid) {
+                    bail!("cloud-hypervisor exited while restoring (see backend.log)");
+                }
+                if vm_dir.join("api.sock").exists()
+                    && unix_http(&vm_dir.join("api.sock"), "GET", "/api/v1/vm.info", None)
+                        .await
+                        .is_ok_and(|(code, _)| code == 200)
+                {
+                    break;
+                }
+                if std::time::Instant::now() > deadline {
+                    signal(pid, libc::SIGKILL);
+                    bail!("cloud-hypervisor didn't finish restoring");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            launch.pid = pid;
+        }
+        other => bail!("{other} can't restore VMs from disk"),
+    }
+    launch.saved = false;
     Ok(())
 }
 
@@ -621,6 +708,7 @@ mod launch_tests {
             helpers: vec![43, 44],
             net: Some(3),
             paused: Some(PauseReason::Idle),
+            saved: false,
         };
         launch.save(dir.path()).unwrap();
         let back = Launch::load(dir.path()).unwrap();

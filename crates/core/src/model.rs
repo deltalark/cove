@@ -365,6 +365,9 @@ pub struct VmStatus {
     /// Set while `state` is `paused`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused_by: Option<PauseReason>,
+    /// Paused with its memory written to disk: it holds no memory or CPU at all.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paused_to_disk: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
