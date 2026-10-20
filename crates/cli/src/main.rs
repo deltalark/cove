@@ -190,6 +190,10 @@ enum Cmd {
         /// What to call this computer's key on the server.
         #[arg(long)]
         name: Option<String>,
+        /// Print the key (with --json, as `key`) instead of saving it, for apps such
+        /// as Runo that keep it themselves.
+        #[arg(long)]
+        no_save: bool,
     },
     /// Forget the server `cove login` saved.
     Logout,
@@ -325,6 +329,10 @@ struct Ensure {
     /// With --create: stop the VM after this many idle minutes.
     #[arg(long = "idle-stop", value_name = "MINUTES")]
     idle_stop: Option<u64>,
+    /// With --create: pause the VM after this many idle minutes; using it resumes
+    /// it. Checked before --idle-stop.
+    #[arg(long = "auto-pause", value_name = "MINUTES")]
+    auto_pause: Option<u64>,
     /// With --create: start from this snapshot.
     #[arg(skip)]
     snapshot: Option<String>,
@@ -429,6 +437,7 @@ async fn ensure_running(client: &Client, name: &str, ensure: &Ensure) -> Result<
             put(&mut body, "backend", ensure.backend.clone());
             put(&mut body, "network", ensure.network);
             put(&mut body, "idle_stop_minutes", ensure.idle_stop);
+            put(&mut body, "auto_pause_minutes", ensure.auto_pause);
             put(&mut body, "snapshot", ensure.snapshot.clone());
             if !allow.is_empty() {
                 body["allow"] = serde_json::json!(allow);
@@ -799,6 +808,7 @@ async fn run(cli: Cli) -> Result<i32> {
                     secrets: vec![],
                 },
                 idle_stop: None,
+                auto_pause: None,
                 snapshot,
             };
             let client = client()?;
@@ -1012,7 +1022,12 @@ async fn run(cli: Cli) -> Result<i32> {
                 println!("This server listens on {}.", client.url);
             });
         }
-        Cmd::Login { url, code, name } => {
+        Cmd::Login {
+            url,
+            code,
+            name,
+            no_save,
+        } => {
             let url = client::server_url(Some(url));
             let name = name.unwrap_or_else(|| {
                 format!(
@@ -1022,6 +1037,12 @@ async fn run(cli: Cli) -> Result<i32> {
             });
             let v = client::pair(&url, &code, &name).await?;
             let key = v["key"].as_str().unwrap_or_default().to_string();
+            if no_save {
+                let out =
+                    serde_json::json!({ "url": url, "name": v["name"], "id": v["id"], "key": key });
+                show(json, &out, || println!("{key}"));
+                return Ok(0);
+            }
             client::save_login(&Paths::from_env(), &url, &key)?;
             let name = v["name"].as_str().unwrap_or("").to_string();
             show(

@@ -958,6 +958,19 @@ fn pause_resume_and_idle_pause() {
     assert_eq!(s.json(&["show", "p1"])["state"], "running");
 
     // `cove sh`'s helper resumes a VM paused on purpose, and stop works on one.
+    // `--create` takes an auto-pause timer, as Runo passes it.
+    s.ok(&[
+        "exec",
+        "p2",
+        "--create",
+        "--backend",
+        "host",
+        "--auto-pause",
+        "20",
+        "--",
+        "true",
+    ]);
+    assert_eq!(s.json(&["show", "p2"])["auto_pause_minutes"], 20);
     s.ok(&["auto-pause", "p1", "0"]);
     s.ok(&["pause", "p1"]);
     s.ok(&["exec", "p1", "--create", "--", "true"]);
@@ -1191,6 +1204,25 @@ fn pairing_gives_a_named_key() {
         .as_array()
         .unwrap()
         .contains(&serde_json::json!("pair")));
+    // An app that keeps the key itself: nothing saved on this computer.
+    let code = s.json(&["pair"])["code"].as_str().unwrap().to_string();
+    let out = cli(&[
+        "--json",
+        "login",
+        &s.url,
+        &code,
+        "--name",
+        "Runo",
+        "--no-save",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["key"].as_str().unwrap().starts_with("cove_"));
+    assert!(!other.path().join("login.json").exists());
     let made = s.json(&["keys", "create", "ci"]);
     assert!(made["key"].as_str().unwrap().starts_with("cove_"));
 }

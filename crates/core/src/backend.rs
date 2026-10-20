@@ -331,8 +331,8 @@ pub fn launch(record: &VmRecord, vm_dir: &Path, opts: &LaunchOptions) -> Result<
             let socket = vm_dir.join("guest.sock");
             let _ = std::fs::remove_file(&socket);
             let _ = std::fs::remove_file(vm_dir.join("rest.sock"));
-            let mut cmd = std::process::Command::new(vfkit);
-            cmd.args(vfkit_args(record, vm_dir))
+            let mut cmd = std::process::Command::new(&vfkit);
+            cmd.args(vfkit_args(record, vm_dir, vfkit_vsock_mode(&vfkit)))
                 .stdout(log.try_clone()?)
                 .stderr(log);
             Launch {
@@ -700,7 +700,38 @@ pub fn mount_tag(index: usize) -> String {
     format!("cove{index}")
 }
 
-pub fn vfkit_args(record: &VmRecord, vm_dir: &Path) -> Vec<String> {
+/// How to ask vfkit to expose the agent's vsock port on a Unix socket that Cove
+/// connects to. vfkit 0.6 swapped the meaning of its two modes: before it, `listen`
+/// did this; from it, `connect` does.
+pub fn vfkit_vsock_mode(vfkit: &Path) -> &'static str {
+    static MODE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    MODE.get_or_init(|| {
+        let text = std::process::Command::new(vfkit)
+            .arg("--version")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        vsock_mode_for(&text)
+    })
+}
+
+/// The mode for `vfkit --version` output such as "vfkit version: v0.6.4".
+pub fn vsock_mode_for(version: &str) -> &'static str {
+    let numbers: Vec<u32> = version
+        .rsplit(['v', ' '])
+        .next()
+        .unwrap_or("")
+        .split('.')
+        .map_while(|p| p.trim().parse().ok())
+        .collect();
+    match numbers.as_slice() {
+        [0, minor, ..] if *minor < 6 => "listen",
+        // Unknown output: assume a current vfkit.
+        _ => "connect",
+    }
+}
+
+pub fn vfkit_args(record: &VmRecord, vm_dir: &Path, vsock_mode: &str) -> Vec<String> {
     let d = |name: &str| vm_dir.join(name).display().to_string();
     let mut args = vec![
         "--cpus".into(),
@@ -723,7 +754,7 @@ pub fn vfkit_args(record: &VmRecord, vm_dir: &Path) -> Vec<String> {
     args.extend([
         "--device".into(),
         format!(
-            "virtio-vsock,port={},socketURL={},listen",
+            "virtio-vsock,port={},socketURL={},{vsock_mode}",
             cove_proto::GUEST_PORT,
             d("guest.sock")
         ),
@@ -777,13 +808,23 @@ mod tests {
             created_at: 0,
             instance_id: "x".into(),
         };
-        let args = vfkit_args(&record, Path::new("/vms/a")).join(" ");
+        let args = vfkit_args(&record, Path::new("/vms/a"), "connect").join(" ");
         assert!(args.starts_with(
             "--cpus 4 --memory 8192 --bootloader efi,variable-store=/vms/a/efi-vars,create"
         ));
         assert!(args.contains("--device virtio-net,nat"));
-        assert!(args.contains("--device virtio-vsock,port=1024,socketURL=/vms/a/guest.sock,listen"));
+        assert!(
+            args.contains("--device virtio-vsock,port=1024,socketURL=/vms/a/guest.sock,connect")
+        );
         assert!(args.ends_with("--device virtio-fs,sharedDir=/Users/me/app,mountTag=cove0"));
+    }
+
+    #[test]
+    fn vsock_mode_follows_the_vfkit_version() {
+        assert_eq!(vsock_mode_for("vfkit version: v0.6.4\n"), "connect");
+        assert_eq!(vsock_mode_for("vfkit version: v0.5.1\n"), "listen");
+        assert_eq!(vsock_mode_for("vfkit version: v1.0.0"), "connect");
+        assert_eq!(vsock_mode_for(""), "connect");
     }
 
     #[test]
@@ -808,7 +849,7 @@ mod tests {
             created_at: 0,
             instance_id: "x".into(),
         };
-        let args = vfkit_args(&record, Path::new("/vms/a")).join(" ");
+        let args = vfkit_args(&record, Path::new("/vms/a"), "connect").join(" ");
         assert!(!args.contains("virtio-net"));
         // The agent's channel is still there.
         assert!(args.contains("virtio-vsock"));
