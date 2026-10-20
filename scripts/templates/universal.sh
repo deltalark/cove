@@ -21,7 +21,7 @@ apt-get install -y -qq --no-install-recommends \
   sqlite3 gh >/dev/null
 
 echo "== docker"
-apt-get install -y -qq --no-install-recommends docker.io docker-compose >/dev/null
+apt-get install -y -qq --no-install-recommends docker.io docker-cli docker-compose >/dev/null
 if [ -d /run/systemd/system ]; then
   systemctl enable --now docker >/dev/null 2>&1 || true
 else
@@ -49,9 +49,11 @@ rm -f /var/lib/dbus/machine-id
 echo "== versions"
 for tool in git python3 node go cargo docker gh claude codex; do
   printf '%-8s ' "$tool"
-  if command -v "$tool" >/dev/null 2>&1; then
-    "$tool" --version 2>/dev/null | head -1
-  else
+  if ! command -v "$tool" >/dev/null 2>&1; then
     echo "not installed"
+  elif [ "$tool" = go ]; then
+    go version || true
+  else
+    { "$tool" --version 2>/dev/null || true; } | head -1
   fi
 done
