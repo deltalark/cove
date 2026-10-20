@@ -178,9 +178,10 @@ pub fn cloud_hypervisor_args(
         args.push("--fs".into());
         for i in 0..record.spec.mounts.len() {
             args.push(format!(
-                "tag={},socket={},num_queues=1,queue_size=512",
+                "tag={},socket={},num_queues=1,queue_size=512,id={}",
                 crate::backend::mount_tag(i),
-                fs_socket(vm_dir, i).display()
+                fs_socket(vm_dir, i).display(),
+                fs_id(i)
             ));
         }
     }
@@ -302,11 +303,46 @@ pub fn state_dir(vm_dir: &Path) -> std::path::PathBuf {
     vm_dir.join("state")
 }
 
-/// Whether a VM can be paused to disk. cloud-hypervisor can't snapshot vhost-user
-/// devices, which is what shared folders (virtio-fs) are, so those VMs pause in
-/// memory instead.
-pub fn can_save(record: &VmRecord) -> bool {
-    record.spec.mounts.is_empty()
+/// The device id of shared folder `index`, so it can be unplugged and plugged back.
+pub fn fs_id(index: usize) -> String {
+    format!("fs{index}")
+}
+
+/// Unplug a VM's shared folders: cloud-hypervisor can't snapshot vhost-user devices,
+/// which is what virtio-fs is. The guest must have unmounted them.
+pub async fn unplug_folders(record: &VmRecord, vm_dir: &Path) -> Result<()> {
+    for i in 0..record.spec.mounts.len() {
+        let body = serde_json::json!({ "id": fs_id(i) }).to_string();
+        api_put_body(vm_dir, "vm.remove-device", Some(&body)).await?;
+    }
+    // The guest acknowledges the unplug on its own time.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    Ok(())
+}
+
+/// Start virtiofsd again and plug the VM's shared folders back in; returns the
+/// helpers' pids. The guest mounts them afterwards.
+pub async fn plug_folders(record: &VmRecord, vm_dir: &Path) -> Result<Vec<u32>> {
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(vm_dir.join("backend.log"))?;
+    let helpers = start_virtiofsd(record, vm_dir, &log)?;
+    for i in 0..record.spec.mounts.len() {
+        let body = serde_json::json!({
+            "tag": crate::backend::mount_tag(i),
+            "socket": fs_socket(vm_dir, i).display().to_string(),
+            "num_queues": 1,
+            "queue_size": 512,
+            "id": fs_id(i),
+        })
+        .to_string();
+        if let Err(e) = api_put_body(vm_dir, "vm.add-fs", Some(&body)).await {
+            stop_helpers(&helpers);
+            return Err(e);
+        }
+    }
+    Ok(helpers)
 }
 
 /// Write a paused VM's memory and devices to [`state_dir`].
@@ -574,7 +610,8 @@ mod tests {
         assert!(args.contains("--serial file=/vms/a/console.log --console off"));
         assert!(args
             .contains("--net tap=cove5,mac=52:54:00:c0:00:05,ip=10.177.0.21,mask=255.255.255.252"));
-        assert!(args.ends_with("--fs tag=cove0,socket=/vms/a/fs0.sock,num_queues=1,queue_size=512"));
+        assert!(args
+            .ends_with("--fs tag=cove0,socket=/vms/a/fs0.sock,num_queues=1,queue_size=512,id=fs0"));
     }
 
     #[test]

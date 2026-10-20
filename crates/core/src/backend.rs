@@ -164,6 +164,9 @@ pub struct Launch {
     /// Paused to disk: its memory is in `state/` and no process runs (`pid` is 0).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub saved: bool,
+    /// gVisor: the platform the sandbox runs on, which a restore must use too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
 }
 
 impl Launch {
@@ -320,6 +323,7 @@ pub fn launch(record: &VmRecord, vm_dir: &Path, opts: &LaunchOptions) -> Result<
                 net: None,
                 paused: None,
                 saved: false,
+                platform: None,
             }
         }
         VFKIT => {
@@ -339,6 +343,7 @@ pub fn launch(record: &VmRecord, vm_dir: &Path, opts: &LaunchOptions) -> Result<
                 net: None,
                 paused: None,
                 saved: false,
+                platform: None,
             }
         }
         CLOUD_HYPERVISOR => {
@@ -391,6 +396,7 @@ pub fn launch(record: &VmRecord, vm_dir: &Path, opts: &LaunchOptions) -> Result<
                 net: net.map(|n| n.0),
                 paused: None,
                 saved: false,
+                platform: None,
             }
         }
         GVISOR => {
@@ -435,15 +441,40 @@ pub async fn resume(record: &VmRecord, vm_dir: &Path, launch: &Launch) -> Result
 /// Whether this VM can be paused to disk, freeing its memory.
 pub fn can_save(record: &VmRecord) -> bool {
     match record.spec.backend.as_str() {
-        CLOUD_HYPERVISOR => crate::chv::can_save(record),
+        // With shared folders, only while nothing in the VM uses them (see save).
+        CLOUD_HYPERVISOR | GVISOR => true,
         _ => false,
     }
 }
 
-/// Write a paused VM's memory to disk and end its process. `launch` becomes saved.
+/// Write a running VM's memory to disk and end its process. `launch` becomes saved.
+/// On failure the VM is left running, as it was.
 pub async fn save(record: &VmRecord, vm_dir: &Path, launch: &mut Launch) -> Result<()> {
     match record.spec.backend.as_str() {
-        CLOUD_HYPERVISOR => crate::chv::save(vm_dir).await?,
+        CLOUD_HYPERVISOR => {
+            let folders = !record.spec.mounts.is_empty();
+            if folders {
+                unmount_folders(record, launch).await?;
+                if let Err(e) = crate::chv::unplug_folders(record, vm_dir).await {
+                    replug(record, vm_dir, launch).await;
+                    return Err(e);
+                }
+                crate::chv::stop_helpers(&launch.helpers);
+                launch.helpers.clear();
+            }
+            let saved = match crate::chv::pause(vm_dir).await {
+                Ok(()) => crate::chv::save(vm_dir).await,
+                Err(e) => Err(e),
+            };
+            if let Err(e) = saved {
+                let _ = crate::chv::resume(vm_dir).await;
+                if folders {
+                    replug(record, vm_dir, launch).await;
+                }
+                return Err(e);
+            }
+        }
+        GVISOR => crate::gvisor::save(&record.spec.name, vm_dir, launch).await?,
         other => bail!("{other} can't pause VMs to disk"),
     }
     signal(launch.pid, libc::SIGKILL);
@@ -458,8 +489,7 @@ pub async fn save(record: &VmRecord, vm_dir: &Path, launch: &mut Launch) -> Resu
     Ok(())
 }
 
-/// Start a VM paused to disk again, from where it was. It comes back paused; the
-/// caller resumes it.
+/// Start a VM paused to disk again, from where it was, and running.
 pub async fn restore(record: &VmRecord, vm_dir: &Path, launch: &mut Launch) -> Result<()> {
     match record.spec.backend.as_str() {
         CLOUD_HYPERVISOR => {
@@ -499,12 +529,106 @@ pub async fn restore(record: &VmRecord, vm_dir: &Path, launch: &mut Launch) -> R
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
+            if let Err(e) = crate::chv::resume(vm_dir).await {
+                signal(pid, libc::SIGKILL);
+                return Err(e);
+            }
             launch.pid = pid;
+            if !record.spec.mounts.is_empty() {
+                match crate::chv::plug_folders(record, vm_dir).await {
+                    Ok(helpers) => launch.helpers = helpers,
+                    Err(e) => {
+                        signal(pid, libc::SIGKILL);
+                        return Err(e.context("plugging the shared folders back in"));
+                    }
+                }
+            }
+        }
+        GVISOR => {
+            let platform = launch.platform.clone().unwrap_or_else(|| "systrap".into());
+            let net = match record.spec.network {
+                Network::Full => launch.net.map(crate::chv::NetSlot),
+                _ => None,
+            };
+            launch.pid = crate::gvisor::restore(record, vm_dir, &platform, net)?;
         }
         other => bail!("{other} can't restore VMs from disk"),
     }
     launch.saved = false;
     Ok(())
+}
+
+/// Unmount a VM's shared folders in the guest. Fails, leaving them all mounted,
+/// when something in the VM is using one (an open file, a shell's working folder).
+async fn unmount_folders(record: &VmRecord, launch: &Launch) -> Result<()> {
+    let mut done = Vec::new();
+    for (i, m) in record.spec.mounts.iter().enumerate() {
+        let out = launch
+            .guest
+            .exec(cove_proto::Command {
+                cmd: vec!["umount".into(), m.guest.clone()],
+                ..Default::default()
+            })
+            .await?;
+        if out.code != Some(0) {
+            for j in done {
+                remount(record, launch, j).await;
+            }
+            bail!(
+                "{} is in use in the VM ({})",
+                m.guest,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        done.push(i);
+    }
+    Ok(())
+}
+
+async fn remount(record: &VmRecord, launch: &Launch, i: usize) {
+    let m = &record.spec.mounts[i];
+    let _ = launch
+        .guest
+        .call(&cove_proto::Request::Mount {
+            tag: mount_tag(i),
+            path: m.guest.clone(),
+            read_only: m.read_only,
+        })
+        .await;
+}
+
+/// Plug a VM's shared folders back in and mount them, after an unplug.
+async fn replug(record: &VmRecord, vm_dir: &Path, launch: &mut Launch) {
+    match crate::chv::plug_folders(record, vm_dir).await {
+        Ok(helpers) => launch.helpers = helpers,
+        Err(e) => eprintln!(
+            "{}: couldn't plug its shared folders back: {e:#}",
+            record.spec.name
+        ),
+    }
+    remount_all(record, launch).await;
+}
+
+/// Mount every shared folder in the guest, waiting a little for hotplugged devices.
+pub async fn remount_all(record: &VmRecord, launch: &Launch) {
+    for i in 0..record.spec.mounts.len() {
+        let m = &record.spec.mounts[i];
+        for _ in 0..50 {
+            let ok = launch
+                .guest
+                .call(&cove_proto::Request::Mount {
+                    tag: mount_tag(i),
+                    path: m.guest.clone(),
+                    read_only: m.read_only,
+                })
+                .await
+                .is_ok();
+            if ok {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
 }
 
 fn signal_group(pid: u32, sig: i32) {
@@ -709,6 +833,7 @@ mod launch_tests {
             net: Some(3),
             paused: Some(PauseReason::Idle),
             saved: false,
+            platform: None,
         };
         launch.save(dir.path()).unwrap();
         let back = Launch::load(dir.path()).unwrap();

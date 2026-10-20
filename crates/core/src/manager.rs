@@ -455,18 +455,27 @@ impl Manager {
             bail!("VM {name:?} is not running");
         };
         if launch.paused.is_none() {
-            backend::pause(&record, &dir, &launch).await?;
-            launch.paused = Some(reason);
-            launch.save(&dir)?;
+            let mut on_disk = false;
             if backend::can_save(&record) {
                 self.stop_egress(name).await;
                 let mut saved = launch.clone();
+                saved.paused = Some(reason);
                 match backend::save(&record, &dir, &mut saved).await {
-                    Ok(()) => launch = saved,
-                    // Still paused, in memory: nothing is lost.
-                    Err(e) => {
-                        eprintln!("{name}: paused in memory; saving it to disk failed: {e:#}")
+                    Ok(()) => {
+                        launch = saved;
+                        on_disk = true;
                     }
+                    // Still running as it was: pause it in memory instead.
+                    Err(e) => {
+                        eprintln!("{name}: pausing in memory; saving it to disk failed: {e:#}")
+                    }
+                }
+            }
+            if !on_disk {
+                if let Err(e) = backend::pause(&record, &dir, &launch).await {
+                    drop(_guard);
+                    let _ = self.start_egress(name).await;
+                    return Err(e);
                 }
             }
         }
@@ -536,7 +545,6 @@ impl Manager {
     /// Bring a VM paused to disk back, and wait for its agent.
     async fn restore(&self, record: &VmRecord, dir: &Path, launch: &mut Launch) -> Result<()> {
         backend::restore(record, dir, launch).await?;
-        backend::resume(record, dir, launch).await?;
         launch.paused = None;
         launch.save(dir)?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -544,6 +552,9 @@ impl Manager {
             if let Ok(Ok(_)) =
                 tokio::time::timeout(Duration::from_secs(2), launch.guest.ping()).await
             {
+                if record.spec.backend == backend::CLOUD_HYPERVISOR {
+                    backend::remount_all(record, launch).await;
+                }
                 return Ok(());
             }
             if !launch.alive() || tokio::time::Instant::now() > deadline {

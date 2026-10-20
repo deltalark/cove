@@ -114,6 +114,12 @@ pub enum Request {
     EgressAccept {
         port: u16,
     },
+    /// Let go of every connection to the host, including this one after `Ok`, and
+    /// stop listening while the file `marker` exists; then listen again. This is how
+    /// a gVisor sandbox is checkpointed: it can't save sockets bound to the host.
+    Suspend {
+        marker: String,
+    },
 }
 
 /// Lines the host may send during a streaming request.

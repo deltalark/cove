@@ -345,6 +345,7 @@ pub fn launch(
                 .and_then(|p| p.trim().parse::<u32>().ok())
                 .context("runsc wrote no pid")?;
             return Ok(Launch {
+                platform: Some(platform.clone()),
                 pid,
                 guest: GuestAddr::Unix {
                     path: socket(vm_dir),
@@ -366,6 +367,108 @@ pub fn launch(
         "{last_error} (see {})",
         vm_dir.join("backend.log").display()
     )
+}
+
+/// The file whose presence keeps the agent from listening (see `Request::Suspend`),
+/// on the host and inside the sandbox.
+fn marker(vm_dir: &Path) -> (PathBuf, String) {
+    (
+        vm_dir.join("run").join("suspended"),
+        format!("{RUN_IN_SANDBOX}/suspended"),
+    )
+}
+
+/// Write a running sandbox's memory to `state/` and end it (`runsc checkpoint`). The
+/// agent first lets go of its sockets to the host, which gVisor can't save; if the
+/// checkpoint fails anyway, the agent listens again and the sandbox carries on.
+pub async fn save(name: &str, vm_dir: &Path, launch: &Launch) -> Result<()> {
+    let (host_marker, guest_marker) = marker(vm_dir);
+    std::fs::write(&host_marker, b"")?;
+    let undo = || {
+        let _ = std::fs::remove_file(&host_marker);
+    };
+    let asked = tokio::time::timeout(
+        Duration::from_secs(10),
+        launch.guest.call(&cove_proto::Request::Suspend {
+            marker: guest_marker,
+        }),
+    )
+    .await;
+    if !matches!(asked, Ok(Ok(_))) {
+        undo();
+        bail!("the guest agent can't suspend (it may be older than this server)");
+    }
+    let state = crate::chv::state_dir(vm_dir);
+    let _ = std::fs::remove_dir_all(&state);
+    std::fs::create_dir_all(&state)?;
+    let id = container_id(name);
+    let image = format!("--image-path={}", state.display());
+    let mut last = Err(anyhow::anyhow!("not tried"));
+    // The agent's threads close their streams within moments; try again once.
+    for wait in [300, 1500] {
+        tokio::time::sleep(Duration::from_millis(wait)).await;
+        last = runsc_checked(vm_dir, &["checkpoint", &image, &id]);
+        if last.is_ok() {
+            break;
+        }
+    }
+    if let Err(e) = last {
+        let _ = std::fs::remove_dir_all(&state);
+        undo();
+        return Err(e);
+    }
+    runsc_quiet(vm_dir, &["delete", "--force", &id]);
+    Ok(())
+}
+
+/// Start a checkpointed sandbox again where it was (`runsc restore`); returns the
+/// sandbox's new pid. It runs once this returns.
+pub fn restore(
+    record: &VmRecord,
+    vm_dir: &Path,
+    platform: &str,
+    net: Option<NetSlot>,
+) -> Result<u32> {
+    use std::os::unix::process::CommandExt;
+    let id = container_id(&record.spec.name);
+    runsc_quiet(vm_dir, &["delete", "--force", &id]);
+    if let Some(slot) = net {
+        crate::chv::setup_nat()?;
+        setup_netns(slot)?;
+    }
+    let pid_file = vm_dir.join("runsc.pid");
+    let _ = std::fs::remove_file(&pid_file);
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(vm_dir.join("backend.log"))?;
+    let state = crate::chv::state_dir(vm_dir);
+    let ok = Command::new(runsc()?)
+        .args(runsc_flags(vm_dir, platform, record.spec.network))
+        .arg("restore")
+        .arg(format!("--image-path={}", state.display()))
+        .arg("--bundle")
+        .arg(vm_dir.join("bundle"))
+        .arg("--pid-file")
+        .arg(&pid_file)
+        .arg("--detach")
+        .arg(&id)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .process_group(0)
+        .status()
+        .context("running runsc")?
+        .success();
+    let _ = std::fs::remove_file(marker(vm_dir).0);
+    if !ok {
+        runsc_quiet(vm_dir, &["delete", "--force", &id]);
+        bail!("runsc couldn't restore the sandbox (see backend.log)");
+    }
+    std::fs::read_to_string(&pid_file)
+        .ok()
+        .and_then(|p| p.trim().parse::<u32>().ok())
+        .context("runsc wrote no pid")
 }
 
 /// Freeze every process in a sandbox (`runsc pause`); memory stays as it is.
