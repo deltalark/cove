@@ -235,9 +235,15 @@ pub fn prepare_rootfs(record: &VmRecord, root: &Path) -> Result<()> {
 /// Copy a root filesystem, keeping owners and modes (and sharing blocks where the
 /// filesystem can).
 pub fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+    // GNU cp shares blocks with --reflink; macOS's (for the dev backend) with -c.
+    let share = if cfg!(target_os = "macos") {
+        "-c"
+    } else {
+        "--reflink=auto"
+    };
     let status = Command::new("cp")
         .arg("-a")
-        .arg("--reflink=auto")
+        .arg(share)
         .arg(from)
         .arg(to)
         .status()
@@ -346,6 +352,7 @@ pub fn launch(
                 started_at: crate::now(),
                 helpers: vec![],
                 net: net.map(|n| n.0),
+                paused: None,
             });
         }
         last_error = format!("runsc couldn't start the sandbox on the {platform} platform");
@@ -358,6 +365,33 @@ pub fn launch(
         "{last_error} (see {})",
         vm_dir.join("backend.log").display()
     )
+}
+
+/// Freeze every process in a sandbox (`runsc pause`); memory stays as it is.
+pub fn pause(name: &str, vm_dir: &Path) -> Result<()> {
+    runsc_checked(vm_dir, &["pause", &container_id(name)])
+}
+
+pub fn resume(name: &str, vm_dir: &Path) -> Result<()> {
+    runsc_checked(vm_dir, &["resume", &container_id(name)])
+}
+
+/// Run a runsc command against this VM's state, with its error on failure.
+fn runsc_checked(vm_dir: &Path, args: &[&str]) -> Result<()> {
+    let out = Command::new(runsc()?)
+        .arg(format!("--root={}", vm_dir.join("runsc").display()))
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .context("running runsc")?;
+    if !out.status.success() {
+        bail!(
+            "runsc {}: {}",
+            args.first().unwrap_or(&""),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// Stop a sandbox: SIGTERM to everything in it, then SIGKILL, then remove it.
@@ -487,6 +521,7 @@ mod tests {
                 idle_stop_minutes: None,
                 allow: Vec::new(),
                 secrets: Vec::new(),
+                ..VmSpec::default()
             },
             created_at: 0,
             instance_id: "x".into(),

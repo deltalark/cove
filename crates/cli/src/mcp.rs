@@ -81,7 +81,10 @@ fn tools() -> Value {
                 "ephemeral": { "type": "boolean", "description": "delete it when stopped" },
                 "network": { "type": "string", "enum": ["full", "off", "allowlist"], "description": "full (default); off: no network at all, for untrusted code; allowlist: only the hosts in `allow`" },
                 "allow": { "type": "array", "items": { "type": "string" }, "description": "with network allowlist: hosts it may reach (example.com, *.example.com) or presets (@dev: git hosts, package registries and model APIs; @agents: model APIs). Default @dev" },
-                "idle_stop_minutes": { "type": "integer", "description": "stop the VM after this many idle minutes" }
+                "idle_stop_minutes": { "type": "integer", "description": "stop the VM after this many idle minutes" },
+                "auto_pause_minutes": { "type": "integer", "description": "pause the VM (memory kept) after this many idle minutes; using it resumes it" },
+                "snapshot": { "type": "string", "description": "start from this snapshot (see vm_snapshot_list) instead of a fresh Debian" },
+                "timeout_minutes": { "type": "integer", "description": "delete the VM this many minutes from now (1 to 1440), for scratch work" }
             }}
         },
         {
@@ -158,6 +161,30 @@ fn tools() -> Value {
             "inputSchema": { "type": "object", "required": ["name"], "properties": { "name": name } }
         },
         {
+            "name": "vm_pause",
+            "description": "Pause a running VM: memory and processes are kept and it uses no CPU until vm_resume.",
+            "inputSchema": { "type": "object", "required": ["name"], "properties": { "name": name } }
+        },
+        {
+            "name": "vm_resume",
+            "description": "Resume a paused VM where it left off.",
+            "inputSchema": { "type": "object", "required": ["name"], "properties": { "name": name } }
+        },
+        {
+            "name": "vm_snapshot_save",
+            "description": "Save a VM's disk as a named snapshot (installed software and files, not memory). A running VM keeps running. New VMs can start from it with vm_create's snapshot, e.g. to set up a project once.",
+            "inputSchema": { "type": "object", "required": ["name", "snapshot"], "properties": {
+                "name": name,
+                "snapshot": { "type": "string", "description": "name for the snapshot: lowercase letters, digits and dashes" },
+                "description": { "type": "string" }
+            }}
+        },
+        {
+            "name": "vm_snapshot_list",
+            "description": "List saved snapshots.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
             "name": "vm_copy",
             "description": "Copy a stopped VM (disk and settings) to a new VM, e.g. to try something risky on a copy.",
             "inputSchema": { "type": "object", "required": ["name", "to"], "properties": {
@@ -216,6 +243,9 @@ async fn call(client: &Client, tool: &str, args: &Value) -> Result<String> {
                 "network",
                 "allow",
                 "idle_stop_minutes",
+                "auto_pause_minutes",
+                "snapshot",
+                "timeout_minutes",
             ] {
                 if !args[key].is_null() {
                     body[key] = args[key].clone();
@@ -224,8 +254,57 @@ async fn call(client: &Client, tool: &str, args: &Value) -> Result<String> {
             if body["network"] == "allowlist" && body["allow"].is_null() {
                 body["allow"] = json!(["@dev"]);
             }
+            if !body["timeout_minutes"].is_null() {
+                body["on_timeout"] = json!("delete");
+            }
             let vm: VmStatus = client.post("/vms", &body).await?;
             Ok(format!("VM {} is running.", vm.name))
+        }
+        "vm_pause" => {
+            let name = arg(args, "name")?;
+            let vm: VmStatus = client.post(&format!("/vms/{name}/pause"), &()).await?;
+            Ok(format!("VM {} is {}.", vm.name, state_text(vm.state)))
+        }
+        "vm_resume" => {
+            let name = arg(args, "name")?;
+            let vm: VmStatus = client.post(&format!("/vms/{name}/resume"), &()).await?;
+            Ok(format!("VM {} is {}.", vm.name, state_text(vm.state)))
+        }
+        "vm_snapshot_save" => {
+            let name = arg(args, "name")?;
+            let snap: cove_core::snapshot::SnapshotInfo = client
+                .post(
+                    &format!("/vms/{name}/snapshots"),
+                    &json!({
+                        "name": arg(args, "snapshot")?,
+                        "description": args["description"].as_str().unwrap_or(""),
+                    }),
+                )
+                .await?;
+            Ok(format!(
+                "Saved {name} as snapshot {} ({} MB).",
+                snap.name,
+                snap.size >> 20
+            ))
+        }
+        "vm_snapshot_list" => {
+            let snaps: Vec<cove_core::snapshot::SnapshotInfo> = client.get("/snapshots").await?;
+            if snaps.is_empty() {
+                return Ok("No snapshots yet.".into());
+            }
+            Ok(snaps
+                .iter()
+                .map(|s| {
+                    let mut line =
+                        format!("{} (from {}, {} MB)", s.name, s.source_vm, s.size >> 20);
+                    if !s.description.is_empty() {
+                        line.push_str(": ");
+                        line.push_str(&s.description);
+                    }
+                    line
+                })
+                .collect::<Vec<_>>()
+                .join("\n"))
         }
         "vm_egress" => {
             let name = arg(args, "name")?;
@@ -455,6 +534,10 @@ mod tests {
             "vm_start",
             "vm_copy",
             "vm_egress",
+            "vm_pause",
+            "vm_resume",
+            "vm_snapshot_save",
+            "vm_snapshot_list",
         ] {
             assert!(names.contains(&t), "{t} missing");
         }

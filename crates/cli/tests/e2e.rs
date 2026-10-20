@@ -896,3 +896,301 @@ fn allowlist_and_secrets_go_through_the_egress_proxy() {
     );
     assert!(String::from_utf8_lossy(&unknown.stderr).contains("hosts"));
 }
+
+/// Wait until `cove show name` has `state`, for up to `secs` seconds.
+fn wait_state(s: &Server, name: &str, state: &str, secs: u64) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let vm = s.json(&["show", name]);
+        if vm["state"] == state {
+            return vm;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{name} never became {state}: {vm}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[test]
+fn pause_resume_and_idle_pause() {
+    let s = start_server_with(&[
+        ("COVE_IDLE_CHECK_SECS", "1"),
+        ("COVE_IDLE_MINUTE_SECS", "1"),
+    ]);
+    s.ok(&["up", "p1", "--backend", "host"]);
+    s.ok(&[
+        "spawn",
+        "p1",
+        "counter",
+        "--",
+        "sh",
+        "-c",
+        "i=0; while true; do i=$((i+1)); echo $i > n; sleep 0.1; done",
+    ]);
+    let vm = s.json(&["pause", "p1"]);
+    assert_eq!(vm["state"], "paused");
+    assert_eq!(vm["paused_by"], "user");
+    // Paused on purpose: the API waits for resume instead of waking for a request
+    // (the CLI's exec and shell resume it, as they start a stopped VM).
+    let refused = s.run(&["ports", "p1"]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("paused"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let vm = s.json(&["resume", "p1"]);
+    assert_eq!(vm["state"], "running");
+    assert!(vm.get("paused_by").is_none());
+    // Its processes carried on where they were.
+    let procs = s.json(&["procs", "p1"]);
+    assert_eq!(procs[0]["running"], true);
+    s.ok(&["kill", "p1", "counter"]);
+
+    // An idle pause wakes up by itself when the VM is used.
+    s.ok(&["auto-pause", "p1", "2"]);
+    let vm = wait_state(&s, "p1", "paused", 15);
+    assert_eq!(vm["paused_by"], "idle");
+    assert!(s.ok(&["ls"]).contains("pause 2m"));
+    assert_eq!(s.ok(&["exec", "p1", "--", "echo", "awake"]).trim(), "awake");
+    assert_eq!(s.json(&["show", "p1"])["state"], "running");
+
+    // `cove sh`'s helper resumes a VM paused on purpose, and stop works on one.
+    s.ok(&["auto-pause", "p1", "0"]);
+    s.ok(&["pause", "p1"]);
+    s.ok(&["exec", "p1", "--create", "--", "true"]);
+    s.ok(&["pause", "p1"]);
+    assert_eq!(s.json(&["stop", "p1"])["state"], "stopped");
+}
+
+#[test]
+fn timeouts_labels_and_rename() {
+    let s = start_server_with(&[
+        ("COVE_IDLE_CHECK_SECS", "1"),
+        ("COVE_IDLE_MINUTE_SECS", "1"),
+    ]);
+    // "2m" lasts two seconds here.
+    let vm = s.json(&[
+        "up",
+        "doomed",
+        "--backend",
+        "host",
+        "--timeout",
+        "2m",
+        "--on-timeout",
+        "delete",
+        "--label",
+        "task=review",
+        "--label",
+        "owner=runo",
+    ]);
+    assert_eq!(vm["timeout"]["action"], "delete");
+    assert_eq!(vm["labels"]["task"], "review");
+    s.ok(&["up", "keeper", "--backend", "host", "--label", "task=build"]);
+    let found = s.json(&["ls", "--label", "task=review"]);
+    assert_eq!(found.as_array().unwrap().len(), 1);
+    assert_eq!(found[0]["name"], "doomed");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while s.run(&["show", "doomed"]).status.success() {
+        assert!(
+            Instant::now() < deadline,
+            "the timeout never deleted the VM"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // A pause timeout fires once, then the VM has none.
+    s.ok(&["timeout", "keeper", "1m"]);
+    let vm = wait_state(&s, "keeper", "paused", 15);
+    assert_eq!(vm["paused_by"], "timeout");
+    assert!(vm.get("timeout").is_none());
+    s.ok(&["resume", "keeper"]);
+    s.ok(&["timeout", "keeper", "3h"]);
+    s.ok(&["timeout", "keeper", "0"]);
+    assert!(s.json(&["show", "keeper"]).get("timeout").is_none());
+    assert!(!s.run(&["timeout", "keeper", "2d"]).status.success());
+
+    s.ok(&["label", "keeper", "task=deploy", "--rm", "missing"]);
+    assert_eq!(s.json(&["show", "keeper"])["labels"]["task"], "deploy");
+
+    // Rename: stopped only, and the old name is free again.
+    assert!(!s.run(&["rename", "keeper", "kept"]).status.success());
+    s.ok(&["stop", "keeper"]);
+    let vm = s.json(&["rename", "keeper", "kept"]);
+    assert_eq!(vm["name"], "kept");
+    assert_eq!(vm["labels"]["task"], "deploy");
+    assert!(!s.run(&["show", "keeper"]).status.success());
+    s.ok(&["start", "kept"]);
+}
+
+#[test]
+fn snapshots_and_settings() {
+    let s = start_server();
+    s.ok(&["up", "base", "--backend", "host"]);
+    s.ok(&[
+        "exec",
+        "base",
+        "--",
+        "sh",
+        "-c",
+        "echo set-up-once > marker",
+    ]);
+    // Saved while running: the VM carries on.
+    let snap = s.json(&[
+        "snapshot",
+        "save",
+        "base",
+        "--name",
+        "ready",
+        "--description",
+        "with marker",
+    ]);
+    assert_eq!(snap["kind"], "host");
+    assert_eq!(snap["source_vm"], "base");
+    assert_eq!(s.json(&["show", "base"])["state"], "running");
+    assert!(!s
+        .run(&["snapshot", "save", "base", "--name", "ready"])
+        .status
+        .success());
+
+    let vm = s.json(&[
+        "up",
+        "from-snap",
+        "--backend",
+        "host",
+        "--snapshot",
+        "ready",
+    ]);
+    assert_eq!(vm["snapshot"], "ready");
+    assert_eq!(
+        s.ok(&["exec", "from-snap", "--", "cat", "marker"]).trim(),
+        "set-up-once"
+    );
+    // Changes in the new VM don't reach the snapshot or the old VM.
+    s.ok(&[
+        "exec",
+        "from-snap",
+        "--",
+        "sh",
+        "-c",
+        "echo changed > marker",
+    ]);
+    assert_eq!(
+        s.ok(&["exec", "base", "--", "cat", "marker"]).trim(),
+        "set-up-once"
+    );
+    let listed = s.json(&["snapshot", "ls"]);
+    assert_eq!(listed[0]["name"], "ready");
+    assert!(!s
+        .run(&["up", "x", "--backend", "host", "--snapshot", "missing"])
+        .status
+        .success());
+
+    // Server settings fill in what a create leaves out.
+    let set = s.json(&[
+        "settings",
+        "set",
+        "cpus=3",
+        "snapshot=ready",
+        "auto_pause_minutes=45",
+    ]);
+    assert_eq!(set["cpus"], 3);
+    let vm = s.json(&["up", "defaults", "--backend", "host"]);
+    assert_eq!(vm["cpus"], 3);
+    assert_eq!(vm["snapshot"], "ready");
+    assert_eq!(vm["auto_pause_minutes"], 45);
+    assert_eq!(
+        s.ok(&["exec", "defaults", "--", "cat", "marker"]).trim(),
+        "set-up-once"
+    );
+    // What the request says wins.
+    let vm = s.json(&[
+        "up",
+        "explicit",
+        "--backend",
+        "host",
+        "--cpus",
+        "1",
+        "--image",
+        "debian-13",
+    ]);
+    assert_eq!(vm["cpus"], 1);
+    assert!(vm.get("snapshot").is_none());
+    assert!(!s.run(&["settings", "set", "cpus=0"]).status.success());
+    let unset = s.json(&[
+        "settings",
+        "unset",
+        "snapshot",
+        "cpus",
+        "auto_pause_minutes",
+    ]);
+    assert_eq!(unset, serde_json::json!({}));
+
+    s.ok(&["snapshot", "rm", "ready"]);
+    assert_eq!(s.json(&["snapshot", "ls"]), serde_json::json!([]));
+    // VMs made from it keep working.
+    assert_eq!(
+        s.ok(&["exec", "from-snap", "--", "cat", "marker"]).trim(),
+        "changed"
+    );
+}
+
+#[test]
+fn pairing_gives_a_named_key() {
+    let s = start_server();
+    let code = s.json(&["pair", "--name", "runo"]);
+    let code = code["code"].as_str().unwrap().to_string();
+    // Another computer: its own Cove folder, no key of its own yet.
+    let other = tempfile::tempdir().unwrap();
+    let cli = |args: &[&str]| {
+        Command::new(bin())
+            .args(args)
+            .env("COVE_HOME", other.path())
+            .env_remove("COVE_URL")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let out = cli(&["login", &s.url, &code, "--name", "laptop"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Logged in: it reaches the server with its own key.
+    let out = cli(&["ls"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Codes work once.
+    assert!(!cli(&["login", &s.url, &code]).status.success());
+    let keys = s.json(&["keys", "ls"]);
+    assert_eq!(keys[0]["name"], "laptop");
+    assert!(keys[0].get("hash").is_none());
+    // Revoked, the key stops working.
+    s.ok(&["keys", "rm", keys[0]["id"].as_str().unwrap()]);
+    assert!(!cli(&["ls"]).status.success());
+    assert!(cli(&["logout"]).status.success());
+
+    // Pairing over HTTP directly, as Runo does.
+    let code = s.json(&["pair"])["code"].as_str().unwrap().to_string();
+    let reply = Command::new("curl")
+        .args(["-s", "-X", "POST", "-H", "Content-Type: application/json"])
+        .arg("-d")
+        .arg(format!(r#"{{"code":"{code}","name":"Runo"}}"#))
+        .arg(format!("{}/v1/pair", s.url))
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&reply.stdout).unwrap();
+    assert!(v["key"].as_str().unwrap().starts_with("cove_"), "{v}");
+    assert!(v["server"]["features"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("pair")));
+    let made = s.json(&["keys", "create", "ci"]);
+    assert!(made["key"].as_str().unwrap().starts_with("cove_"));
+}

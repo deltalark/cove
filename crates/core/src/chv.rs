@@ -252,17 +252,29 @@ pub fn setup_nat() -> Result<()> {
 /// Ask cloud-hypervisor to press the VM's power button (ACPI shutdown), for when the
 /// guest agent doesn't answer.
 pub async fn power_button(vm_dir: &Path) -> Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut s = crate::guest::connect_unix(&vm_dir.join("api.sock")).await?;
-    s.write_all(
-        b"PUT /api/v1/vm.power-button HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+    api_put(vm_dir, "vm.power-button").await
+}
+
+/// Freeze the VM's vCPUs; memory stays as it is.
+pub async fn pause(vm_dir: &Path) -> Result<()> {
+    api_put(vm_dir, "vm.pause").await
+}
+
+pub async fn resume(vm_dir: &Path) -> Result<()> {
+    api_put(vm_dir, "vm.resume").await
+}
+
+/// `PUT /api/v1/<action>` on the VM's API socket.
+async fn api_put(vm_dir: &Path, action: &str) -> Result<()> {
+    let status = crate::backend::unix_http(
+        &vm_dir.join("api.sock"),
+        "PUT",
+        &format!("/api/v1/{action}"),
+        None,
     )
     .await?;
-    let mut reply = [0u8; 64];
-    let n = s.read(&mut reply).await?;
-    let status = String::from_utf8_lossy(&reply[..n]);
-    if !status.starts_with("HTTP/1.1 2") {
-        bail!("cloud-hypervisor: {}", status.lines().next().unwrap_or(""));
+    if !(200..300).contains(&status.0) {
+        bail!("cloud-hypervisor {action}: {}", status.1);
     }
     Ok(())
 }
@@ -469,6 +481,7 @@ mod tests {
                 idle_stop_minutes: None,
                 allow: Vec::new(),
                 secrets: Vec::new(),
+                ..VmSpec::default()
             },
             created_at: 0,
             instance_id: "x".into(),

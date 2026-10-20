@@ -20,6 +20,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 struct App {
     manager: Arc<Manager>,
     key: Arc<String>,
+    pairing: Arc<std::sync::Mutex<cove_core::keys::Pairing>>,
 }
 
 pub struct ApiError(StatusCode, String);
@@ -33,10 +34,22 @@ impl IntoResponse for ApiError {
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
         let text = format!("{e:#}");
-        let status = if text.starts_with("no VM named") || text.starts_with("no process named") {
+        let status = if text.starts_with("no VM named")
+            || text.starts_with("no process named")
+            || text.starts_with("no snapshot named")
+            || text.starts_with("no key")
+        {
             StatusCode::NOT_FOUND
-        } else if text.contains("is not running") || text.contains("already exists") {
+        } else if text.contains("is not running")
+            || text.contains("already exists")
+            || text.contains("is paused")
+            || text.starts_with("stop ")
+        {
             StatusCode::CONFLICT
+        } else if text.starts_with("too many wrong pairing codes") {
+            StatusCode::TOO_MANY_REQUESTS
+        } else if text.starts_with("that pairing code") {
+            StatusCode::FORBIDDEN
         } else {
             StatusCode::BAD_REQUEST
         };
@@ -50,15 +63,26 @@ pub fn router(manager: Arc<Manager>, key: String) -> Router {
     let app = App {
         manager,
         key: Arc::new(key),
+        pairing: Default::default(),
     };
     let api = Router::new()
         .route("/images", get(images))
         .route("/images/{name}/pull", post(pull_image))
         .route("/vms", get(list).post(create))
-        .route("/vms/{name}", get(status).delete(remove))
+        .route("/vms/{name}", get(status).delete(remove).patch(update))
         .route("/vms/{name}/start", post(start))
         .route("/vms/{name}/stop", post(stop))
+        .route("/vms/{name}/pause", post(pause))
+        .route("/vms/{name}/resume", post(resume))
+        .route("/vms/{name}/rename", post(rename))
         .route("/vms/{name}/copy", post(copy))
+        .route("/vms/{name}/snapshots", post(save_snapshot))
+        .route("/snapshots", get(snapshots))
+        .route("/snapshots/{name}", get(snapshot).delete(remove_snapshot))
+        .route("/settings", get(settings).put(set_settings))
+        .route("/keys", get(keys).post(create_key))
+        .route("/keys/{id}", delete(remove_key))
+        .route("/pair/codes", post(pair_code))
         .route("/vms/{name}/exec", post(exec))
         .route("/vms/{name}/stream", get(stream))
         .route("/vms/{name}/procs", get(procs))
@@ -75,6 +99,8 @@ pub fn router(manager: Arc<Manager>, key: String) -> Router {
         .route_layer(middleware::from_fn_with_state(app.clone(), auth));
     Router::new()
         .route("/v1/health", get(health))
+        // Needs no key: a pairing code is how a client gets one.
+        .route("/v1/pair", post(pair))
         .nest("/v1", api)
         .with_state(app)
 }
@@ -90,7 +116,9 @@ async fn auth(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("");
-    if !constant_time_eq(given.as_bytes(), app.key.as_bytes()) {
+    if !constant_time_eq(given.as_bytes(), app.key.as_bytes())
+        && !cove_core::keys::valid(&app.manager.paths, given)
+    {
         return ApiError(StatusCode::UNAUTHORIZED, "missing or wrong API key".into())
             .into_response();
     }
@@ -113,6 +141,15 @@ pub const FEATURES: &[&str] = &[
     "files",
     "stdin-eof",
     "egress",
+    "pause",
+    "auto-pause",
+    "timeout",
+    "labels",
+    "rename",
+    "snapshots",
+    "settings",
+    "keys",
+    "pair",
 ];
 
 /// Also lists `backend:<name>` for each backend that can run VMs here, and the one
@@ -154,8 +191,36 @@ async fn pull_image(
     Ok(Json(image::list(&app.manager.paths)))
 }
 
-async fn list(State(app): State<App>) -> Json<Vec<cove_core::VmStatus>> {
-    Json(app.manager.list().await)
+/// `?label=key=value`, repeated: only VMs with every one of those labels.
+async fn list(
+    State(app): State<App>,
+    Query(query): Query<Vec<(String, String)>>,
+) -> ApiResult<Vec<cove_core::VmStatus>> {
+    let mut wanted = Vec::new();
+    for (k, v) in &query {
+        if k != "label" {
+            continue;
+        }
+        match v.split_once('=') {
+            Some((key, value)) => wanted.push((key.to_string(), value.to_string())),
+            None => {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    "label filters are key=value".into(),
+                ))
+            }
+        }
+    }
+    let vms = app.manager.list().await;
+    Ok(Json(
+        vms.into_iter()
+            .filter(|vm| {
+                wanted
+                    .iter()
+                    .all(|(k, v)| vm.labels.get(k).is_some_and(|have| have == v))
+            })
+            .collect(),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -164,17 +229,194 @@ struct CreateBody {
     spec: VmSpec,
     #[serde(default = "yes")]
     start: bool,
+    /// Pause or delete it this many minutes from now.
+    #[serde(default)]
+    timeout_minutes: Option<u64>,
+    #[serde(default)]
+    on_timeout: cove_core::model::TimeoutAction,
 }
 
 fn yes() -> bool {
     true
 }
 
+/// Fields the request leaves out come from the server's settings.
 async fn create(
     State(app): State<App>,
-    Json(body): Json<CreateBody>,
+    Json(mut body): Json<serde_json::Value>,
 ) -> ApiResult<cove_core::VmStatus> {
-    Ok(Json(app.manager.create(body.spec, body.start).await?))
+    cove_core::settings::Settings::load(&app.manager.paths).apply(&mut body);
+    let body: CreateBody = serde_json::from_value(body)
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("bad request: {e}")))?;
+    let mut spec = body.spec;
+    if let Some(minutes) = body.timeout_minutes {
+        let request = cove_core::model::TimeoutRequest {
+            minutes,
+            action: body.on_timeout,
+        };
+        spec.timeout = Some(
+            request
+                .resolve(cove_core::now(), cove_core::minute_secs())
+                .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?,
+        );
+    }
+    Ok(Json(app.manager.create(spec, body.start).await?))
+}
+
+async fn update(
+    State(app): State<App>,
+    Path(name): Path<String>,
+    Json(update): Json<cove_core::model::VmUpdate>,
+) -> ApiResult<cove_core::VmStatus> {
+    Ok(Json(app.manager.update(&name, update).await?))
+}
+
+async fn pause(State(app): State<App>, Path(name): Path<String>) -> ApiResult<cove_core::VmStatus> {
+    Ok(Json(
+        app.manager
+            .pause(&name, cove_core::model::PauseReason::User)
+            .await?,
+    ))
+}
+
+async fn resume(
+    State(app): State<App>,
+    Path(name): Path<String>,
+) -> ApiResult<cove_core::VmStatus> {
+    Ok(Json(app.manager.resume(&name).await?))
+}
+
+#[derive(Deserialize)]
+struct RenameBody {
+    to: String,
+}
+
+async fn rename(
+    State(app): State<App>,
+    Path(name): Path<String>,
+    Json(body): Json<RenameBody>,
+) -> ApiResult<cove_core::VmStatus> {
+    Ok(Json(app.manager.rename(&name, &body.to).await?))
+}
+
+#[derive(Deserialize)]
+struct SnapshotBody {
+    name: String,
+    #[serde(default)]
+    description: String,
+}
+
+async fn save_snapshot(
+    State(app): State<App>,
+    Path(name): Path<String>,
+    Json(body): Json<SnapshotBody>,
+) -> ApiResult<cove_core::snapshot::SnapshotInfo> {
+    Ok(Json(
+        app.manager
+            .save_snapshot(&name, &body.name, &body.description)
+            .await?,
+    ))
+}
+
+async fn snapshots(State(app): State<App>) -> Json<Vec<cove_core::snapshot::SnapshotInfo>> {
+    Json(cove_core::snapshot::list(&app.manager.paths))
+}
+
+async fn snapshot(
+    State(app): State<App>,
+    Path(name): Path<String>,
+) -> ApiResult<cove_core::snapshot::SnapshotInfo> {
+    Ok(Json(cove_core::snapshot::load(&app.manager.paths, &name)?))
+}
+
+async fn remove_snapshot(
+    State(app): State<App>,
+    Path(name): Path<String>,
+) -> ApiResult<serde_json::Value> {
+    cove_core::snapshot::remove(&app.manager.paths, &name)?;
+    Ok(Json(serde_json::json!({ "deleted": name })))
+}
+
+async fn settings(State(app): State<App>) -> Json<cove_core::settings::Settings> {
+    Json(cove_core::settings::Settings::load(&app.manager.paths))
+}
+
+/// Replaces every setting; send back what `GET` gave, changed.
+async fn set_settings(
+    State(app): State<App>,
+    Json(settings): Json<cove_core::settings::Settings>,
+) -> ApiResult<cove_core::settings::Settings> {
+    settings.save(&app.manager.paths)?;
+    Ok(Json(settings))
+}
+
+async fn keys(State(app): State<App>) -> Json<Vec<cove_core::keys::KeyInfo>> {
+    Json(cove_core::keys::list(&app.manager.paths))
+}
+
+#[derive(Deserialize)]
+struct KeyBody {
+    name: String,
+}
+
+/// The key itself is in the reply only; the server keeps its hash.
+async fn create_key(
+    State(app): State<App>,
+    Json(body): Json<KeyBody>,
+) -> ApiResult<serde_json::Value> {
+    let (info, key) = cove_core::keys::create(&app.manager.paths, &body.name)?;
+    Ok(Json(
+        serde_json::json!({ "id": info.id, "name": info.name, "created_at": info.created_at, "key": key }),
+    ))
+}
+
+async fn remove_key(
+    State(app): State<App>,
+    Path(id): Path<String>,
+) -> ApiResult<cove_core::keys::KeyInfo> {
+    Ok(Json(cove_core::keys::remove(&app.manager.paths, &id)?))
+}
+
+#[derive(Deserialize, Default)]
+struct PairCodeBody {
+    /// What the key it pairs is called, unless the client names it.
+    #[serde(default)]
+    name: Option<String>,
+}
+
+async fn pair_code(
+    State(app): State<App>,
+    body: Option<Json<PairCodeBody>>,
+) -> Json<serde_json::Value> {
+    let name = body
+        .and_then(|b| b.0.name)
+        .unwrap_or_else(|| "paired client".into());
+    let (code, expires_at) = app.pairing.lock().unwrap().issue(&name);
+    Json(serde_json::json!({ "code": code, "expires_at": expires_at }))
+}
+
+#[derive(Deserialize)]
+struct PairBody {
+    code: String,
+    /// What to call the new key, such as "Runo on Anish's MacBook".
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Trade a one-time code for a named API key of the client's own.
+async fn pair(State(app): State<App>, Json(body): Json<PairBody>) -> ApiResult<serde_json::Value> {
+    let issued_name = app.pairing.lock().unwrap().redeem(&body.code)?;
+    let name = body
+        .name
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or(issued_name);
+    let (info, key) = cove_core::keys::create(&app.manager.paths, &name)?;
+    Ok(Json(serde_json::json!({
+        "id": info.id,
+        "name": info.name,
+        "key": key,
+        "server": health_value(),
+    })))
 }
 
 async fn status(
@@ -215,14 +457,14 @@ async fn exec(
     Path(name): Path<String>,
     Json(command): Json<cove_proto::Command>,
 ) -> ApiResult<cove_core::guest::ExecOutput> {
-    let guest = app.manager.guest(&name)?;
+    let guest = app.manager.guest(&name).await?;
     // A long command keeps the VM busy for idle stop, like an open stream.
     let _open = app.manager.stream_opened(&name);
     Ok(Json(guest.exec(command).await?))
 }
 
 async fn procs(State(app): State<App>, Path(name): Path<String>) -> ApiResult<serde_json::Value> {
-    let guest = app.manager.guest(&name)?;
+    let guest = app.manager.guest(&name).await?;
     Ok(Json(guest.call(&cove_proto::Request::Procs).await?))
 }
 
@@ -236,7 +478,7 @@ async fn kill(
     Path((name, proc)): Path<(String, String)>,
     Query(q): Query<KillQuery>,
 ) -> ApiResult<serde_json::Value> {
-    let guest = app.manager.guest(&name)?;
+    let guest = app.manager.guest(&name).await?;
     Ok(Json(
         guest
             .call(&cove_proto::Request::Kill {
@@ -258,7 +500,7 @@ async fn read_file(
     Path(name): Path<String>,
     Query(q): Query<FileQuery>,
 ) -> Result<Vec<u8>, ApiError> {
-    let guest = app.manager.guest(&name)?;
+    let guest = app.manager.guest(&name).await?;
     let data: Bytes = guest
         .call_as(&cove_proto::Request::ReadFile { path: q.path })
         .await?;
@@ -271,7 +513,7 @@ async fn write_file(
     Query(q): Query<FileQuery>,
     body: axum::body::Bytes,
 ) -> ApiResult<serde_json::Value> {
-    let guest = app.manager.guest(&name)?;
+    let guest = app.manager.guest(&name).await?;
     let mode = match q.mode.as_deref() {
         Some(m) => Some(
             u32::from_str_radix(m, 8)
@@ -292,7 +534,7 @@ async fn list_dir(
     Path(name): Path<String>,
     Query(q): Query<FileQuery>,
 ) -> ApiResult<serde_json::Value> {
-    let guest = app.manager.guest(&name)?;
+    let guest = app.manager.guest(&name).await?;
     Ok(Json(
         guest
             .call(&cove_proto::Request::ListDir { path: q.path })
@@ -356,7 +598,7 @@ async fn stream(
     Path(name): Path<String>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    let guest = app.manager.guest(&name)?;
+    let guest = app.manager.guest(&name).await?;
     let open = app.manager.stream_opened(&name);
     Ok(ws.on_upgrade(move |socket| async move {
         bridge(socket, guest).await;
@@ -462,18 +704,18 @@ pub async fn serve(manager: Arc<Manager>, listen: &str) -> Result<()> {
         "cove serving on {url} (data in {})",
         manager.paths.root.display()
     );
-    tokio::spawn(stop_idle_vms(manager.clone()));
+    tokio::spawn(check_timers(manager.clone()));
     // VMs that kept running while the server was down need their proxies back.
-    manager.resume().await;
+    manager.restart_proxies().await;
     axum::serve(listener, router(manager, key))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
 }
 
-/// Check for idle VMs every `COVE_IDLE_CHECK_SECS` (30 by default).
+/// Check idle timers and timeouts every `COVE_IDLE_CHECK_SECS` (30 by default).
 /// `COVE_IDLE_MINUTE_SECS` shortens a minute so tests don't wait for real ones.
-async fn stop_idle_vms(manager: Arc<Manager>) {
+async fn check_timers(manager: Arc<Manager>) {
     let secs = |var: &str, default: u64| {
         std::env::var(var)
             .ok()
@@ -485,8 +727,8 @@ async fn stop_idle_vms(manager: Arc<Manager>) {
     let minute = std::time::Duration::from_secs(secs("COVE_IDLE_MINUTE_SECS", 60));
     loop {
         tokio::time::sleep(every).await;
-        for name in manager.stop_idle(minute).await {
-            eprintln!("stopped {name}: idle");
+        for (name, what) in manager.check_timers(minute).await {
+            eprintln!("{name}: {what}");
         }
     }
 }
