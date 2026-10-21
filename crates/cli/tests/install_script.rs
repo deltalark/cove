@@ -28,6 +28,7 @@ fn parses() {
         "--prefix",
         "--version",
         "--no-service",
+        "--https",
         "--from-source",
         "--uninstall",
     ] {

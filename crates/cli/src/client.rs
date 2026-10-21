@@ -6,6 +6,7 @@ use cove_proto::{Frame, Input, Request};
 use futures_util::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::sync::Arc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -14,6 +15,9 @@ pub struct Client {
     pub url: String,
     key: String,
     http: reqwest::Client,
+    /// The server's certificate when we pin it rather than check it against the web's
+    /// authorities: its self-signed one, from pairing.
+    fingerprint: Option<String>,
 }
 
 impl Client {
@@ -36,10 +40,12 @@ impl Client {
                     )
                 })?,
         };
+        let fingerprint = pinned_fingerprint(&paths, &url);
         Ok(Client {
+            http: http_client(fingerprint.as_deref(), None)?,
             url,
             key,
-            http: reqwest::Client::new(),
+            fingerprint,
         })
     }
 
@@ -136,19 +142,26 @@ impl Client {
         let mut req = ws_url.into_client_request()?;
         req.headers_mut()
             .insert("authorization", format!("Bearer {}", self.key).parse()?);
-        let (mut socket, _) = tokio_tungstenite::connect_async(req)
-            .await
-            .map_err(|e| match e {
-                tokio_tungstenite::tungstenite::Error::Http(response) => {
-                    let body = response.body().clone().unwrap_or_default();
-                    let message = serde_json::from_slice::<serde_json::Value>(&body)
-                        .ok()
-                        .and_then(|v| v["error"].as_str().map(String::from))
-                        .unwrap_or_else(|| format!("HTTP {}", response.status()));
-                    anyhow!(message)
-                }
-                other => anyhow!("opening the stream: {other}"),
-            })?;
+        let connector = match &self.fingerprint {
+            Some(fp) => Some(tokio_tungstenite::Connector::Rustls(Arc::new(
+                cove_core::https::pinned_client_config(fp)?,
+            ))),
+            None => None,
+        };
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async_tls_with_config(req, None, false, connector)
+                .await
+                .map_err(|e| match e {
+                    tokio_tungstenite::tungstenite::Error::Http(response) => {
+                        let body = response.body().clone().unwrap_or_default();
+                        let message = serde_json::from_slice::<serde_json::Value>(&body)
+                            .ok()
+                            .and_then(|v| v["error"].as_str().map(String::from))
+                            .unwrap_or_else(|| format!("HTTP {}", response.status()));
+                        anyhow!(message)
+                    }
+                    other => anyhow!("opening the stream: {other}"),
+                })?;
         socket
             .send(Message::Text(serde_json::to_string(request)?.into()))
             .await?;
@@ -161,6 +174,9 @@ impl Client {
 pub struct Login {
     pub url: String,
     pub key: String,
+    /// The server's self-signed certificate, pinned when we paired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
 pub fn load_login(paths: &Paths) -> Option<Login> {
@@ -168,7 +184,7 @@ pub fn load_login(paths: &Paths) -> Option<Login> {
     serde_json::from_str(&text).ok()
 }
 
-pub fn save_login(paths: &Paths, url: &str, key: &str) -> Result<()> {
+pub fn save_login(paths: &Paths, url: &str, key: &str, fingerprint: Option<&str>) -> Result<()> {
     std::fs::create_dir_all(&paths.root)?;
     let path = paths.login_file();
     std::fs::write(
@@ -176,6 +192,7 @@ pub fn save_login(paths: &Paths, url: &str, key: &str) -> Result<()> {
         serde_json::to_vec_pretty(&Login {
             url: url.to_string(),
             key: key.to_string(),
+            fingerprint: fingerprint.map(String::from),
         })?,
     )?;
     cove_core::paths::restrict(&path, 0o600);
@@ -183,11 +200,17 @@ pub fn save_login(paths: &Paths, url: &str, key: &str) -> Result<()> {
 }
 
 /// Trade a pairing code for a key of our own (`POST /v1/pair`, which needs none).
-pub async fn pair(url: &str, code: &str, name: &str) -> Result<serde_json::Value> {
-    let response = reqwest::Client::new()
+/// With `fingerprint`, the server must show exactly that certificate, checked before
+/// the code is sent.
+pub async fn pair(
+    url: &str,
+    code: &str,
+    name: &str,
+    fingerprint: Option<&str>,
+) -> Result<serde_json::Value> {
+    let response = http_client(fingerprint, Some(15))?
         .post(format!("{url}/v1/pair"))
         .json(&serde_json::json!({ "code": code, "name": name }))
-        .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
         .with_context(|| format!("can't reach the cove server at {url}"))?;
@@ -224,9 +247,9 @@ pub fn server_url(host: Option<String>) -> String {
 
 /// `GET /v1/health`, which needs no API key.
 pub async fn health(url: &str) -> Result<serde_json::Value> {
-    let response = reqwest::Client::new()
+    let fingerprint = pinned_fingerprint(&Paths::from_env(), url);
+    let response = http_client(fingerprint.as_deref(), Some(5))?
         .get(format!("{url}/v1/health"))
-        .timeout(std::time::Duration::from_secs(5))
         .send()
         .await
         .with_context(|| format!("can't reach the cove server at {url}"))?;
@@ -234,6 +257,92 @@ pub async fn health(url: &str) -> Result<serde_json::Value> {
         bail!("the server at {url} answered {}", response.status());
     }
     Ok(response.json().await?)
+}
+
+/// An HTTP client that, given a fingerprint, trusts only that certificate.
+fn http_client(fingerprint: Option<&str>, timeout_secs: Option<u64>) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder();
+    if let Some(fp) = fingerprint {
+        builder = builder.use_preconfigured_tls(cove_core::https::pinned_client_config(fp)?);
+    }
+    if let Some(t) = timeout_secs {
+        builder = builder.timeout(std::time::Duration::from_secs(t));
+    }
+    Ok(builder.build()?)
+}
+
+/// The certificate to pin for `url`: `COVE_FINGERPRINT`, else the one saved when this
+/// computer paired with it, else the local server's own when `url` is its HTTPS address.
+fn pinned_fingerprint(paths: &Paths, url: &str) -> Option<String> {
+    if !url.starts_with("https://") {
+        return None;
+    }
+    if let Ok(fp) = std::env::var("COVE_FINGERPRINT") {
+        return Some(fp);
+    }
+    if let Some(fp) = load_login(paths)
+        .filter(|l| l.url == url)
+        .and_then(|l| l.fingerprint)
+    {
+        return Some(fp);
+    }
+    let text = std::fs::read_to_string(paths.server_file()).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    if v["https_url"].as_str() == Some(url) {
+        return v["fingerprint"].as_str().map(String::from);
+    }
+    None
+}
+
+/// What `cove login` was given: a `cove://` pair string, or a URL and a code.
+#[derive(Debug, PartialEq)]
+pub struct PairTarget {
+    pub url: String,
+    pub code: String,
+    pub fingerprint: Option<String>,
+}
+
+pub fn parse_pair_target(
+    first: &str,
+    code: Option<&str>,
+    fingerprint: Option<&str>,
+) -> Result<PairTarget> {
+    if let Some(rest) = first.strip_prefix("cove://") {
+        let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+        let (host, code) = path
+            .trim_end_matches('/')
+            .rsplit_once('/')
+            .ok_or_else(|| anyhow!("{first} has no pairing code after the address"))?;
+        let mut fp = fingerprint.map(String::from);
+        for pair in query.split('&') {
+            if let Some(v) = pair.strip_prefix("fp=") {
+                fp = Some(v.to_string());
+            }
+        }
+        let fingerprint = fp
+            .map(|f| cove_core::https::normalize_fingerprint(&f))
+            .transpose()?;
+        return Ok(PairTarget {
+            url: format!("https://{host}"),
+            code: code.to_string(),
+            fingerprint,
+        });
+    }
+    let code = code.ok_or_else(|| {
+        anyhow!("give the server's URL and the code from cove pair, or the cove:// line it prints")
+    })?;
+    let url = server_url(Some(first.to_string()));
+    let fingerprint = fingerprint
+        .map(cove_core::https::normalize_fingerprint)
+        .transpose()?;
+    if fingerprint.is_some() && !url.starts_with("https://") {
+        bail!("--fingerprint is for an https:// address");
+    }
+    Ok(PairTarget {
+        url,
+        code: code.to_string(),
+        fingerprint,
+    })
 }
 
 pub struct Stream {
@@ -290,5 +399,37 @@ impl StreamReceiver {
             }
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pair_strings() {
+        let fp = format!("sha256:{}", "ab".repeat(32));
+        let t = parse_pair_target(
+            &format!("cove://203.0.113.7:7443/K7QF-2MXD?fp={fp}"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            t,
+            PairTarget {
+                url: "https://203.0.113.7:7443".into(),
+                code: "K7QF-2MXD".into(),
+                fingerprint: Some(fp.clone()),
+            }
+        );
+        let t = parse_pair_target("cove://cove.example.com/ABCD", None, None).unwrap();
+        assert_eq!(t.url, "https://cove.example.com");
+        assert_eq!(t.fingerprint, None);
+        let t = parse_pair_target("https://h:7443/", Some("ABCD"), Some(&"AB".repeat(32))).unwrap();
+        assert_eq!(t.url, "https://h:7443");
+        assert_eq!(t.fingerprint, Some(fp));
+        assert!(parse_pair_target("http://h:7457", Some("ABCD"), Some(&"ab".repeat(32))).is_err());
+        assert!(parse_pair_target("https://h", None, None).is_err());
     }
 }

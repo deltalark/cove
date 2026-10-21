@@ -309,10 +309,12 @@ dependencies = [
  "futures-util",
  "libc",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite 0.26.2",
 ]
 

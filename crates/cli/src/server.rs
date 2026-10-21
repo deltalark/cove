@@ -21,6 +21,16 @@ struct App {
     manager: Arc<Manager>,
     key: Arc<String>,
     pairing: Arc<std::sync::Mutex<cove_core::keys::Pairing>>,
+    public: Option<Arc<Public>>,
+}
+
+/// Where clients on other computers reach this server over HTTPS, and the certificate
+/// they should expect there.
+pub struct Public {
+    pub url: String,
+    /// Set for a self-signed certificate, which clients pin; `None` for one a public
+    /// authority signed.
+    pub fingerprint: Option<String>,
 }
 
 pub struct ApiError(StatusCode, String);
@@ -59,11 +69,12 @@ impl From<anyhow::Error> for ApiError {
 
 type ApiResult<T> = Result<Json<T>, ApiError>;
 
-pub fn router(manager: Arc<Manager>, key: String) -> Router {
+pub fn router(manager: Arc<Manager>, key: String, public: Option<Arc<Public>>) -> Router {
     let app = App {
         manager,
         key: Arc::new(key),
         pairing: Default::default(),
+        public,
     };
     let api = Router::new()
         .route("/images", get(images))
@@ -154,6 +165,7 @@ pub const FEATURES: &[&str] = &[
     "settings",
     "keys",
     "pair",
+    "https",
 ];
 
 /// Also lists `backend:<name>` for each backend that can run VMs here, and the one
@@ -454,7 +466,24 @@ async fn pair_code(
         .and_then(|b| b.0.name)
         .unwrap_or_else(|| "paired client".into());
     let (code, expires_at) = app.pairing.lock().unwrap().issue(&name);
-    Json(serde_json::json!({ "code": code, "expires_at": expires_at }))
+    let mut v = serde_json::json!({ "code": code, "expires_at": expires_at });
+    if let Some(p) = &app.public {
+        v["url"] = p.url.clone().into();
+        v["fingerprint"] = p.fingerprint.clone().into();
+        v["pair"] = pair_string(&p.url, &code, p.fingerprint.as_deref()).into();
+    }
+    Json(v)
+}
+
+/// One string with everything a client needs to pair: where the server is, the code,
+/// and the certificate to expect. `cove login` and Runo take it as it is.
+/// `cove://203.0.113.7:7443/K7QF-2MXD?fp=sha256:9f2c…`
+pub fn pair_string(url: &str, code: &str, fingerprint: Option<&str>) -> String {
+    let host = url.trim_start_matches("https://").trim_end_matches('/');
+    match fingerprint {
+        Some(fp) => format!("cove://{host}/{code}?fp={fp}"),
+        None => format!("cove://{host}/{code}"),
+    }
 }
 
 #[derive(Deserialize)]
@@ -753,14 +782,50 @@ async fn send_frame(tx: &mut (impl SinkExt<Message> + Unpin), frame: &Frame) -> 
     tx.send(Message::Text(text.into())).await.map_err(|_| ())
 }
 
-pub async fn serve(manager: Arc<Manager>, listen: &str) -> Result<()> {
+/// `cove serve --https`: where to listen, and the name clients use to reach it.
+pub struct HttpsOptions {
+    pub listen: String,
+    pub public_host: Option<String>,
+}
+
+pub async fn serve(manager: Arc<Manager>, listen: &str, https: Option<HttpsOptions>) -> Result<()> {
     let key = manager.paths.load_or_create_api_key()?;
     let listener = tokio::net::TcpListener::bind(listen).await?;
     let addr = listener.local_addr()?;
     let url = format!("http://{addr}");
+    let mut tls = None;
+    let mut public = None;
+    if let Some(opts) = https {
+        let tcp = tokio::net::TcpListener::bind(&opts.listen).await?;
+        let bound = tcp.local_addr()?;
+        let host = opts
+            .public_host
+            .clone()
+            .unwrap_or_else(|| public_ip(bound.ip()).to_string());
+        let cert = cove_core::https::load_or_create_self_signed(
+            &manager.paths.root.join("tls"),
+            std::slice::from_ref(&host),
+        )?;
+        let p = Public {
+            url: https_url(&host, bound.port()),
+            fingerprint: Some(cert.fingerprint()),
+        };
+        eprintln!(
+            "cove serving HTTPS on {bound}, for clients at {} (certificate {})",
+            p.url,
+            p.fingerprint.as_deref().unwrap_or("")
+        );
+        tls = Some(TlsListener::spawn(tcp, cert.server_config()?));
+        public = Some(Arc::new(p));
+    }
     std::fs::write(
         manager.paths.server_file(),
-        serde_json::to_vec_pretty(&serde_json::json!({ "url": url, "pid": std::process::id() }))?,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "url": url,
+            "pid": std::process::id(),
+            "https_url": public.as_ref().map(|p| p.url.clone()),
+            "fingerprint": public.as_ref().and_then(|p| p.fingerprint.clone()),
+        }))?,
     )?;
     eprintln!(
         "cove serving on {url} (data in {})",
@@ -769,10 +834,106 @@ pub async fn serve(manager: Arc<Manager>, listen: &str) -> Result<()> {
     tokio::spawn(check_timers(manager.clone()));
     // VMs that kept running while the server was down need their proxies back.
     manager.restart_proxies().await;
-    axum::serve(listener, router(manager, key))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let app = router(manager, key, public);
+    match tls {
+        Some(tls) => {
+            let plain =
+                axum::serve(listener, app.clone()).with_graceful_shutdown(shutdown_signal());
+            let secure = axum::serve(tls, app).with_graceful_shutdown(shutdown_signal());
+            tokio::try_join!(async { plain.await }, async { secure.await })?;
+        }
+        None => {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown_signal())
+                .await?
+        }
+    }
     Ok(())
+}
+
+fn https_url(host: &str, port: u16) -> String {
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    match port {
+        443 => format!("https://{host}"),
+        p => format!("https://{host}:{p}"),
+    }
+}
+
+/// The address other computers most likely reach us at: the bound one, or for
+/// `0.0.0.0` the one this machine sends from to the internet (no packet is sent).
+fn public_ip(bound: std::net::IpAddr) -> std::net::IpAddr {
+    if !bound.is_unspecified() {
+        return bound;
+    }
+    let probe = |target: &str, local: &str| {
+        let s = std::net::UdpSocket::bind(local).ok()?;
+        s.connect(target).ok()?;
+        s.local_addr().ok().map(|a| a.ip())
+    };
+    let found = if bound.is_ipv4() {
+        probe("1.1.1.1:80", "0.0.0.0:0")
+    } else {
+        probe("[2606:4700:4700::1111]:80", "[::]:0").or_else(|| probe("1.1.1.1:80", "0.0.0.0:0"))
+    };
+    found.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+}
+
+/// A listener that does the TLS handshake off the accept loop, so one slow client
+/// can't hold up the rest.
+struct TlsListener {
+    rx: tokio::sync::mpsc::Receiver<(
+        tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        std::net::SocketAddr,
+    )>,
+    addr: std::net::SocketAddr,
+}
+
+impl TlsListener {
+    fn spawn(tcp: tokio::net::TcpListener, config: Arc<rustls::ServerConfig>) -> TlsListener {
+        let addr = tcp.local_addr().expect("bound listener");
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let acceptor = tokio_rustls::TlsAcceptor::from(config);
+        tokio::spawn(async move {
+            loop {
+                let Ok((conn, peer)) = tcp.accept().await else {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                };
+                let acceptor = acceptor.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let handshake = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        acceptor.accept(conn),
+                    );
+                    if let Ok(Ok(tls)) = handshake.await {
+                        let _ = tx.send((tls, peer)).await;
+                    }
+                });
+            }
+        });
+        TlsListener { rx, addr }
+    }
+}
+
+impl axum::serve::Listener for TlsListener {
+    type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        match self.rx.recv().await {
+            Some(conn) => conn,
+            None => std::future::pending().await,
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        Ok(self.addr)
+    }
 }
 
 /// Check idle timers and timeouts every `COVE_IDLE_CHECK_SECS` (30 by default).
