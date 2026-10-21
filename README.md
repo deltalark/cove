@@ -1,10 +1,15 @@
 <div align="center">
 
-# Cove
+<a href="#get-started">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/hero-dark.svg">
+    <img alt="Cove: your own cloud computers for coding agents. A terminal starts a VM with an allowlist and a secret, lists signed-in agents, runs Claude Code in the VM and pauses it to disk." src="docs/assets/hero-light.svg" width="100%">
+  </picture>
+</a>
 
-### Your own cloud computers for coding agents.
+<br/>
 
-Real Linux VMs that boot in seconds, pause to disk, snapshot while running and keep your keys out of reach.<br/>
+**Real Linux VMs that boot in seconds, pause to disk, snapshot while running and keep your keys out of reach.**<br/>
 On your Mac, your server or a $10 VPS. Driven from a CLI, an HTTP API, MCP or [Runo](https://github.com/deltalark/runo).
 
 [![CI](https://github.com/deltalark/cove/actions/workflows/ci.yml/badge.svg)](https://github.com/deltalark/cove/actions/workflows/ci.yml)
@@ -14,109 +19,22 @@ On your Mac, your server or a $10 VPS. Driven from a CLI, an HTTP API, MCP or [R
 ![Linux · KVM or gVisor](https://img.shields.io/badge/Linux-KVM%20or%20gVisor-lightgrey?logo=linux&logoColor=white)
 ![Status: early](https://img.shields.io/badge/status-early-orange)
 
-[Install](#install) · [Tour](#a-quick-tour) · [With Runo](#cove-and-runo) · [Where it runs](#where-cove-runs) · [Secrets](#secrets-and-the-allowlist) · [Reference](#reference) · [How it works](#how-it-works) · [Roadmap](#roadmap)
+[**Get started**](#get-started) · [Use it from your agent](#use-it-from-your-agent) · [Run it on a server](#run-it-on-a-server) · [Tour](#a-quick-tour) · [Secrets](#secrets-and-the-allowlist) · [Reference](#reference) · [FAQ](#faq)
 
 </div>
 
-```console
-$ curl -fsSL https://raw.githubusercontent.com/deltalark/cove/main/scripts/install.sh | sh
-$ cove sh
-root@dev:~# cargo test
-```
+<br/>
 
 Coding agents are most useful when you let them run anything, and most dangerous for the same reason. Cove gives every agent, and every person, a real Linux machine of its own: it boots in seconds, keeps its state, sees only the folders you share, reaches only the hosts you allow, and never holds your API keys.
 
-## Why Cove
+## Get started
 
-<table>
-<tr>
-<td width="50%" valign="top">
-
-**Real VMs, not containers**<br/>
-Debian 13 with its own kernel, and you are root. Apple's Virtualization.framework on a Mac, cloud-hypervisor on Linux with KVM, gVisor on a VPS without it.
-
-</td>
-<td width="50%" valign="top">
-
-**Pause to disk, wake on use**<br/>
-A paused VM keeps its memory and running programs, and on Linux it uses no RAM at all. Idle VMs pause themselves, and the next command or port visit wakes them in about a second.
-
-</td>
-</tr>
-<tr>
-<td valign="top">
-
-**Snapshots**<br/>
-Save a VM while it runs and start new ones from it. Set a project up once with `cove snapshot build`, and every VM after that starts ready.
-
-</td>
-<td valign="top">
-
-**Keys never enter the VM**<br/>
-Inside, your API keys are placeholders. Cove's proxy swaps in the real values only on HTTPS requests to the hosts each key belongs to.
-
-</td>
-</tr>
-<tr>
-<td valign="top">
-
-**Only the hosts you allow**<br/>
-`--network allowlist` gives a VM no network device at all: it reaches only its allowlist, through Cove's proxy, and every attempt is logged.
-
-</td>
-<td valign="top">
-
-**Work that outlives your laptop**<br/>
-`cove spawn` starts a named process that keeps running when you disconnect. `cove attach` replays what you missed and follows on.
-
-</td>
-</tr>
-<tr>
-<td valign="top">
-
-**Built for agents**<br/>
-An MCP server lets any agent make its own VMs, run commands and background jobs, move files, share ports, pause and snapshot.
-
-</td>
-<td valign="top">
-
-**One binary, your hardware**<br/>
-One install line on a Mac or Linux box. No account, no per-second bill. Pair Runo or another computer with a one-time code.
-
-</td>
-</tr>
-</table>
-
-## Install
-
-<table>
-<tr>
-<th align="left">On a Mac (Apple Silicon)</th>
-<th align="left">On a Linux server or VPS</th>
-</tr>
-<tr>
-<td valign="top">
+**1. Install.** One line, on a Mac with Apple Silicon or a Linux box:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/deltalark/cove/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/deltalark/cove/main/scripts/install.sh | sh        # Mac
+curl -fsSL https://raw.githubusercontent.com/deltalark/cove/main/scripts/install.sh | sudo sh   # Linux server or VPS
 ```
-
-Installs vfkit with Homebrew if needed and starts `cove serve` at login.
-
-</td>
-<td valign="top">
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/deltalark/cove/main/scripts/install.sh | sudo sh
-```
-
-Root, because VMs with a network need it. Installs cloud-hypervisor with KVM, or gVisor without it, and a systemd service.
-
-</td>
-</tr>
-</table>
-
-Then check the machine with `cove doctor`, which lists what each backend needs, what is missing and how to fix it.
 
 <details>
 <summary><b>What the install script does, and its options</b></summary>
@@ -133,6 +51,167 @@ Running it again upgrades in place; your VMs, images and keys in `~/.cove` are l
 **Uninstall** with `--uninstall`. It stops the service and removes the binaries and keeps `~/.cove`; add `--purge` to stop every VM and delete `~/.cove` too.
 
 </details>
+
+**2. Open a shell in a fresh VM.** The first time makes a Debian 13 VM called `dev`; after that it drops you straight back in.
+
+```console
+$ cove sh
+root@dev:~# cargo test
+```
+
+**3. Hand it to your agent.** One line, and Claude Code can make its own VMs, run code in them, move files and share ports:
+
+```sh
+claude mcp add -s user cove -- cove mcp
+```
+
+That's it. `cove doctor` checks the machine if anything looks off, and [the rest of the tour](#a-quick-tour) shows pausing, snapshots and secrets.
+
+## Why Cove
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+### 🖥️ Real VMs, not containers
+Debian 13 with its own kernel, and you are root. Apple's Virtualization.framework on a Mac, cloud-hypervisor on Linux with KVM, gVisor on a VPS without it.
+
+</td>
+<td width="50%" valign="top">
+
+### ⏸️ Pause to disk, wake on use
+A paused VM keeps its memory and running programs, and on Linux it uses no RAM at all. Idle VMs pause themselves, and the next command or port visit wakes them in about a second.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+### 📸 Snapshots
+Save a VM while it runs and start new ones from it. Set a project up once with `cove snapshot build`, and every VM after that starts ready.
+
+</td>
+<td valign="top">
+
+### 🔑 Keys never enter the VM
+Inside, your API keys are placeholders. Cove's proxy swaps in the real values only on HTTPS requests to the hosts each key belongs to.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+### 🧱 Only the hosts you allow
+`--network allowlist` gives a VM no network device at all: it reaches only its allowlist, through Cove's proxy, and every attempt is logged.
+
+</td>
+<td valign="top">
+
+### 🌙 Work that outlives your laptop
+`cove spawn` starts a named process that keeps running when you disconnect. `cove attach` replays what you missed and follows on.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+### 🤖 Built for agents
+An MCP server lets any agent make its own VMs, run commands and background jobs, move files, share ports, pause and snapshot. Sign an agent in once per server, and every VM is signed in.
+
+</td>
+<td valign="top">
+
+### 🏠 One binary, your hardware
+One install line on a Mac or Linux box. No account, no per-second bill. Pair Runo or another computer with a one-time code.
+
+</td>
+</tr>
+</table>
+
+### Cove next to a container
+
+| | Cove | A Docker container |
+| --- | --- | --- |
+| Kernel | Its own (or gVisor's, without KVM) | Shares the host's |
+| Pause | Memory and processes kept, written to disk on Linux | `docker pause` freezes it, still in RAM |
+| Keep a running machine as an image | `cove snapshot save`, processes included | `docker commit` saves files only |
+| API keys | Placeholders inside; real values added on the way out | Whatever you pass in, readable inside |
+| Network limits | Per-VM allowlist with a log, built in | Up to you |
+| Agent tools | `cove mcp`, ready for any MCP agent | Up to you |
+
+## Use it from your agent
+
+`cove mcp` gives an agent tools to make VMs, run commands and background jobs, read and write files, share ports, pause and snapshot. Register it once:
+
+| Agent | Command |
+| --- | --- |
+| **Claude Code** | `claude mcp add -s user cove -- cove mcp` |
+| **Codex** | `codex mcp add cove -- cove mcp` |
+| **Gemini CLI** | `gemini mcp add -s user cove cove mcp` |
+| **Qwen Code** | `qwen mcp add -s user cove cove mcp` |
+| **OpenCode** | in `~/.config/opencode/opencode.json`: `"mcp": { "cove": { "type": "local", "command": ["cove", "mcp"] } }` |
+| **Cursor**, and any other MCP client | in its MCP config (`~/.cursor/mcp.json` for Cursor): `"mcpServers": { "cove": { "command": "cove", "args": ["mcp"] } }` |
+| **[Runo](https://github.com/deltalark/runo)** | Built in: [see below](#cove-and-runo) |
+
+Then just ask: *"Make a Cove VM with the network off and run this script in it"*, *"Try upgrading to React 19 in a scratch VM and tell me what breaks"*, *"Start the integration tests in a VM and check back on them later."*
+
+The tools act on whichever server `cove` talks to: the one on this machine, or [a server you logged in to](#run-it-on-a-server). On purpose, they can't give a VM secrets or widen its allowlist, so an agent can't loosen its own sandbox.
+
+## Run it on a server
+
+For VMs that keep working while your laptop sleeps, and for Linux machines with more cores than your laptop.
+
+**1. On the server**, install Cove and make a one-time pairing code:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/deltalark/cove/main/scripts/install.sh | sudo sh
+cove pair                      # prints a code that works once, for 10 minutes
+```
+
+**2. Reach it from your computer.** The API listens on `127.0.0.1:7457` on the server, so nothing is open to the internet until you choose to open it. Pick one:
+
+<table>
+<tr>
+<th align="left" width="50%">An SSH tunnel: nothing to set up</th>
+<th align="left" width="50%">Your own domain, with HTTPS</th>
+</tr>
+<tr>
+<td valign="top">
+
+```sh
+ssh -fN -L 7457:127.0.0.1:7457 you@server
+```
+
+Then use `http://127.0.0.1:7457` as the server's URL. Keep the tunnel up with `autossh` or your SSH config.
+
+</td>
+<td valign="top">
+
+Point a DNS name at the server and let [Caddy](https://caddyserver.com) get the certificate:
+
+```caddy
+cove.example.com {
+    reverse_proxy 127.0.0.1:7457
+}
+```
+
+Then use `https://cove.example.com`. Nothing else to keep running on your side.
+
+</td>
+</tr>
+</table>
+
+**3. Log in from your computer**, with the URL and the code:
+
+```sh
+cove login https://cove.example.com 4F7K-Q2XM     # or http://127.0.0.1:7457 through the tunnel
+cove ls                                           # every cove command, and cove mcp, now uses that server
+```
+
+Each computer gets an API key of its own, which `cove keys rm` on the server revokes. Ten wrong pairing codes in a row lock pairing for 10 minutes. Sign your agents in there once with [`cove agents login`](#agent-logins), and every VM on that server is signed in.
+
+> [!TIP]
+> Coming next: `cove serve --domain` gets its own certificate without Caddy, and `cove connect you@server` does all three steps from your laptop in one command. See [the proposal](docs/easy-setup.md).
 
 ## A quick tour
 
@@ -192,39 +271,6 @@ stateDiagram-v2
     stopped --> [*]: cove rm
 ```
 
-## Cove and Runo
-
-Cove is built to work hand in hand with [Runo](https://github.com/deltalark/runo), the native app for running coding agents side by side. In Runo, a Cove server is a **Connection**, and every session picks where it **Runs on**: your Mac, or any connection, moving between them between agent turns.
-
-**Set it up from Runo.** Settings › Connections finds the Cove on your Mac by itself, and installs it if it isn't there. For a server:
-
-1. Install Cove on the server with the Linux line above (Runo's Cove settings have it ready to copy).
-2. Run `cove pair` there. It prints a one-time code, good for 10 minutes.
-3. In Runo, add a Cove connection with the server's URL and that code, and press **Pair**. Runo gets a key of its own, which `cove keys rm` on the server revokes.
-
-The API is plain HTTP on `127.0.0.1:7457` by default, so reach a server through an SSH tunnel (`ssh -L 7457:127.0.0.1:7457 my-server`, then `http://127.0.0.1:7457`), or put an HTTPS reverse proxy in front of it before opening it up with `--listen`. Another computer's CLI connects the same way: `cove login <url> <code>`.
-
-**What a session gets:**
-
-- **On your Mac's Cove**, a VM of its own with the worktree shared in at the same path. The agent and terminals run in the VM; git, diffs and pull requests keep running on the Mac against the same files, so moving between the two is instant.
-- **On a remote Cove**, the VM keeps its own copy of the worktree, synced through git after every agent turn, uncommitted changes and the agent's conversation included. Close your laptop and the turn keeps running as a Cove named process; when Runo opens again it reattaches and brings the work back.
-- **When idle**, a session's VM pauses (or stops, if you prefer), and the next message wakes it.
-- **Agents use Cove too.** Through `cove mcp`, an agent can make scratch VMs of its own: to research without touching the worktree, run untrusted code with the network off, or hand a heavy build to a bigger machine.
-
-Runo checks `/v1/health` to see what a server supports, so an older Cove keeps working for what it can do.
-
-## Where Cove runs
-
-| Host | Backend | Isolation | Pause |
-| --- | --- | --- | --- |
-| macOS on Apple Silicon | `vfkit`: Apple's Virtualization.framework | A real VM with its own kernel | In memory |
-| Linux with KVM (bare metal, or a VPS with nested virtualization) | `cloud-hypervisor` | A real VM with its own kernel | To disk, about 1 s each way |
-| Linux without KVM (most cheap VPS plans) | `gvisor`: gVisor sandboxes | gVisor's own kernel in user space between the VM's processes and the host's | To disk, under half a second |
-
-`--backend auto`, the default, picks the strongest one the machine has, and `cove doctor` shows which. Each VM keeps the backend it was made with. A VM whose shared folders are in use when it pauses keeps its memory in RAM, so nothing it has open breaks.
-
-On Linux, VMs with the network on get their own /30 in `10.177.0.0/16` with NAT to the internet. They can't reach each other, the host's own services, or the cloud metadata endpoint (`169.254.0.0/16`), which on many providers hands out the server's credentials. gVisor sandboxes boot in about a second and need no KVM, but don't enforce `--disk` and have no systemd inside.
-
 ## Agent logins
 
 Sign in to an agent once per server, and every VM is signed in:
@@ -271,6 +317,33 @@ evil.example                               443  BLOCKED: not on this VM's allowl
 - **Limits:** secrets go in request headers only, over HTTPS, on HTTP/1.1 (streaming responses work; WebSocket upgrades don't yet). With `--network full`, secrets still work but the allowlist isn't enforced.
 
 On purpose, MCP can't give a VM secrets or change its allowlist: an agent shouldn't be able to widen its own sandbox. People do that with the CLI or the API.
+
+## Where Cove runs
+
+| Host | Backend | Isolation | Pause |
+| --- | --- | --- | --- |
+| macOS on Apple Silicon | `vfkit`: Apple's Virtualization.framework | A real VM with its own kernel | In memory |
+| Linux with KVM (bare metal, or a VPS with nested virtualization) | `cloud-hypervisor` | A real VM with its own kernel | To disk, about 1 s each way |
+| Linux without KVM (most cheap VPS plans) | `gvisor`: gVisor sandboxes | gVisor's own kernel in user space between the VM's processes and the host's | To disk, under half a second |
+
+`--backend auto`, the default, picks the strongest one the machine has, and `cove doctor` shows which. Each VM keeps the backend it was made with. A VM whose shared folders are in use when it pauses keeps its memory in RAM, so nothing it has open breaks.
+
+On Linux, VMs with the network on get their own /30 in `10.177.0.0/16` with NAT to the internet. They can't reach each other, the host's own services, or the cloud metadata endpoint (`169.254.0.0/16`), which on many providers hands out the server's credentials. gVisor sandboxes boot in about a second and need no KVM, but don't enforce `--disk` and have no systemd inside.
+
+## Cove and Runo
+
+Cove is built to work hand in hand with [Runo](https://github.com/deltalark/runo), the native app for running coding agents side by side. In Runo, a Cove server is a **Connection**, and every session picks where it **Runs on**: your Mac, or any connection, moving between them between agent turns.
+
+**Set it up from Runo.** Settings › Connections finds the Cove on your Mac by itself, and installs it if it isn't there. For a server, [install Cove and run `cove pair` there](#run-it-on-a-server), then add a Cove connection in Runo with the server's URL and the code, and press **Pair**. Runo gets a key of its own, which `cove keys rm` on the server revokes. Its **Sign in** buttons sign agents in on that server, for every VM.
+
+**What a session gets:**
+
+- **On your Mac's Cove**, a VM of its own with the worktree shared in at the same path. The agent and terminals run in the VM; git, diffs and pull requests keep running on the Mac against the same files, so moving between the two is instant.
+- **On a remote Cove**, the VM keeps its own copy of the worktree, synced through git after every agent turn, uncommitted changes and the agent's conversation included. Close your laptop and the turn keeps running as a Cove named process; when Runo opens again it reattaches and brings the work back.
+- **When idle**, a session's VM pauses (or stops, if you prefer), and the next message wakes it.
+- **Agents use Cove too.** Through `cove mcp`, an agent can make scratch VMs of its own: to research without touching the worktree, run untrusted code with the network off, or hand a heavy build to a bigger machine.
+
+Runo checks `/v1/health` to see what a server supports, so an older Cove keeps working for what it can do.
 
 ## Reference
 
@@ -429,14 +502,54 @@ flowchart LR
 - [x] Server settings, named keys and pairing codes; Runo Connections with turns that outlive your laptop
 - [x] Agent logins: sign in once per server, refreshed tokens kept in step across VMs
 
-**Next**
+**Next**, with the plan for the first three in [docs/easy-setup.md](docs/easy-setup.md)
 
+- [ ] `cove serve --domain`: HTTPS on your own domain, certificate included
+- [ ] `cove connect you@server`: install, pair and connect from your laptop in one command
+- [ ] `cove mcp install <agent>` for Claude Code, Codex, Gemini, Qwen Code, OpenCode and Cursor
 - [ ] SSH from any terminal: a gateway with keys and paste-anywhere tokens
 - [ ] Public HTTPS ports on your own domain, with wake on visit
 - [ ] Secrets stored on the server and changeable on a running VM
 - [ ] A desktop agents can drive (computer use), with share links
 - [ ] A TypeScript SDK and a web dashboard
 - [ ] Pause to disk on a Mac
+
+## FAQ
+
+<details>
+<summary><b>Does my server need KVM?</b></summary>
+
+No. With KVM (bare metal, or a VPS plan with nested virtualization) Cove runs real VMs with cloud-hypervisor. Without it, which is most cheap VPS plans, it runs gVisor sandboxes: gVisor's own kernel in user space between the VM's processes and the host's. `cove doctor` tells you which you have.
+
+</details>
+
+<details>
+<summary><b>Is it safe to open to the internet?</b></summary>
+
+The API listens on `127.0.0.1` unless you change it. Behind HTTPS, every request but `/v1/health` and pairing needs an API key. Keys are stored as hashes and revoked one by one, and ten wrong pairing codes in a row lock pairing for 10 minutes. Don't open the plain HTTP port itself: use a tunnel or HTTPS.
+
+</details>
+
+<details>
+<summary><b>What does it cost?</b></summary>
+
+Nothing beyond the machine it runs on. Cove has no account, no telemetry and no per-second bill. A paused VM on Linux costs only its disk space.
+
+</details>
+
+<details>
+<summary><b>Can the agent in a VM see my API keys?</b></summary>
+
+Not the ones you give with `--secret`: inside, they are placeholders, and the real value is added by Cove's proxy on the way out, only to that key's hosts. Agent logins from `cove agents` are different. They are the agents' own login files, so the agent in the VM can read them. Use secrets when that matters.
+
+</details>
+
+<details>
+<summary><b>Windows? Intel Macs?</b></summary>
+
+Not yet. The CLI works anywhere Rust does, so you can drive a Linux server from any computer, but `cove serve` needs Apple Silicon or Linux.
+
+</details>
 
 ## Development
 
