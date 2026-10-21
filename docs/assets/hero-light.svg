@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="560" viewBox="0 0 1280 560" role="img" aria-label="Cove: your own cloud computers for coding agents">
+<defs>
+  <radialGradient id="g" cx="78%" cy="20%" r="70%"><stop offset="0" stop-color="#0969da" stop-opacity="0.22"/><stop offset="1" stop-color="#0969da" stop-opacity="0"/></radialGradient>
+  <linearGradient id="wave" x1="0" x2="1"><stop offset="0" stop-color="#0969da" stop-opacity="0.9"/><stop offset="1" stop-color="#3fb950" stop-opacity="0.9"/></linearGradient>
+  <filter id="sh" x="-10%" y="-10%" width="120%" height="130%"><feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#000" flood-opacity="0.18"/></filter>
+</defs>
+<rect width="1280" height="560" rx="24" fill="#f6f8fa"/>
+<rect width="1280" height="560" rx="24" fill="url(#g)"/>
+<rect x="0.5" y="0.5" width="1279" height="559" rx="24" fill="none" stroke="#d0d7de"/>
+<g transform="translate(72,150)">
+<rect width="64" height="64" rx="16" fill="url(#wave)"/>
+<path d="M14 40 q9 -10 18 0 t18 0" fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round"/>
+<path d="M14 28 q9 -10 18 0 t18 0" fill="none" stroke="#fff" stroke-opacity="0.6" stroke-width="5" stroke-linecap="round"/>
+<text x="84" y="48" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="48" font-weight="700" fill="#1f2328" letter-spacing="-1">Cove</text>
+<text x="0" y="126" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="34" font-weight="600" fill="#1f2328" letter-spacing="-0.5">Your own cloud computers</text>
+<text x="0" y="168" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="34" font-weight="600" fill="#0969da" letter-spacing="-0.5">for coding agents.</text>
+<text x="0" y="222" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="19" fill="#57606a">Real Linux VMs on your Mac or server.</text>
+<text x="0" y="254" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="19" fill="#57606a">Pause to disk. Snapshot while running.</text>
+<text x="0" y="286" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="19" fill="#57606a">Your keys never enter the VM.</text>
+</g>
+<g filter="url(#sh)"><rect x="560" y="72" width="648" height="416" rx="14" fill="#0d1117" stroke="#d0d7de"/></g>
+<path d="M560 86 a14 14 0 0 1 14 -14 h620 a14 14 0 0 1 14 14 v26 h-648 z" fill="#161b22"/>
+<circle cx="582" cy="92" r="6" fill="#ff5f57"/>
+<circle cx="602" cy="92" r="6" fill="#febc2e"/>
+<circle cx="622" cy="92" r="6" fill="#28c840"/>
+<text x="884.0" y="97" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,monospace" font-size="13" fill="#8b949e">~ — cove</text>
+<text x="586" y="152" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,monospace" font-size="15.5"><tspan fill="#79c0ff">$ </tspan><tspan fill="#e6edf3">cove up agent --network allowlist --secret ANTHROPIC_API_KEY</tspan></text>
+<text x="586" y="186" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,monospace" font-size="15.5"><tspan fill="#3fb950">✓ </tspan><tspan fill="#8b949e">agent  running  debian-13  cloud-hypervisor  2 cpus  4 GB</tspan></text>
+<text x="586" y="226" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,monospace" font-size="15.5"><tspan fill="#79c0ff">$ </tspan><tspan fill="#e6edf3">cove agents ls</tspan></text>
+<text x="602" y="260" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,monospace" font-size="15.5" fill="#8b949e">claude    Claude Code   signed in</text>
+<text x="602" y="294" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,monospace" font-size="15.5" fill="#8b949e">codex     Codex         signed in</text>
+<text x="586" y="334" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,monospace" font-size="15.5"><tspan fill="#79c0ff">$ </tspan><tspan fill="#e6edf3">cove exec agent -- claude -p &quot;make the tests pass&quot;</tspan></text>
+<text x="602" y="368" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,monospace" font-size="15.5" fill="#8b949e">Running 214 tests…  all passed</text>
+<text x="586" y="408" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,monospace" font-size="15.5"><tspan fill="#79c0ff">$ </tspan><tspan fill="#e6edf3">cove pause agent</tspan></text>
+<text x="586" y="442" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,monospace" font-size="15.5"><tspan fill="#3fb950">✓ </tspan><tspan fill="#8b949e">agent  paused to disk, using no memory</tspan></text>
+<rect x="586" y="454" width="10" height="20" fill="#e6edf3" opacity="0.8"/>
+</svg>
