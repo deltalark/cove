@@ -1398,3 +1398,62 @@ fn acme_gets_an_ip_certificate_from_pebble() {
     let pem = std::fs::read_to_string(&saved).unwrap();
     assert!(pem.contains("BEGIN CERTIFICATE"));
 }
+
+#[test]
+fn mcp_over_http_uses_the_callers_key() {
+    let s = start_server();
+    s.ok(&["up", "mh1", "--backend", "host"]);
+    let key = s.json(&["keys", "create", "hosted-agent"])["key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let post = |key: &str, body: serde_json::Value| {
+        let out = Command::new("curl")
+            .args(["-s", "--noproxy", "*", "-w", "\n%{http_code}", "-X", "POST"])
+            .args(["-H", "Content-Type: application/json"])
+            .args(["-H", &format!("Authorization: Bearer {key}")])
+            .arg("-d")
+            .arg(body.to_string())
+            .arg(format!("{}/v1/mcp", s.url))
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let (body, status) = text.rsplit_once('\n').unwrap();
+        (status.to_string(), body.to_string())
+    };
+    let call = |id: u32, method: &str, params: serde_json::Value| serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+
+    let (status, _) = post("wrong", call(1, "initialize", serde_json::json!({})));
+    assert_eq!(status, "401");
+
+    let (status, body) = post(&key, call(1, "initialize", serde_json::json!({})));
+    assert_eq!(status, "200");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["result"]["serverInfo"]["name"], "cove");
+
+    // Notifications get no body.
+    let note = serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+    assert_eq!(post(&key, note).0, "202");
+
+    let (_, body) = post(
+        &key,
+        call(
+            2,
+            "tools/call",
+            serde_json::json!({ "name": "vm_exec", "arguments": { "name": "mh1", "command": "echo from-http-mcp" } }),
+        ),
+    );
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let text = v["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("from-http-mcp"), "{v}");
+
+    // Batches answer each request.
+    let batch = serde_json::json!([
+        call(3, "ping", serde_json::json!({})),
+        call(4, "tools/list", serde_json::json!({}))
+    ]);
+    let (_, body) = post(&key, batch);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 2);
+    s.ok(&["rm", "mh1"]);
+}

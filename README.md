@@ -159,6 +159,15 @@ It finds the agents that are installed, adds Cove the way each one expects, and 
 | **Cursor**, and any other MCP client | in its MCP config (`~/.cursor/mcp.json` for Cursor): `"mcpServers": { "cove": { "command": "cove", "args": ["mcp"] } }` |
 | **[Runo](https://github.com/deltalark/runo)** | Built in: [see below](#cove-and-runo) |
 
+**An agent on another machine, or a hosted one?** A server with HTTPS also speaks MCP over HTTP at `/v1/mcp`, behind a key of the agent's own:
+
+```sh
+cove keys create claude-web          # on the server; prints the key once
+claude mcp add --transport http cove https://cove.example.com/v1/mcp --header "Authorization: Bearer <key>"
+```
+
+Any client that takes a URL and a header works the same way. Use a server with a Let's Encrypt certificate (`--domain`) for clients that can't pin one.
+
 Then just ask: *"Make a Cove VM with the network off and run this script in it"*, *"Try upgrading to React 19 in a scratch VM and tell me what breaks"*, *"Start the integration tests in a VM and check back on them later."*
 
 The tools act on whichever server `cove` talks to: the one on this machine, or [a server you logged in to](#run-it-on-a-server). On purpose, they can't give a VM secrets or widen its allowlist, so an agent can't loosen its own sandbox.
@@ -424,6 +433,7 @@ Every request carries `Authorization: Bearer <key>`: the server's own key (`cove
 | `POST` · `GET` `DELETE` | `/v1/vms/{name}/snapshots` · `/v1/snapshots`, `/v1/snapshots/{name}` | Save a VM `{name, description}`; list and delete |
 | `GET` `PUT` | `/v1/settings` | Defaults for new VMs: `cpus, memory_mb, disk_gb, backend, network, allow, auto_pause_minutes, idle_stop_minutes, snapshot` |
 | `GET` `POST` · `DELETE` | `/v1/keys` · `/v1/keys/{id}` | POST `{name}` returns a new key once |
+| `POST` | `/v1/mcp` | MCP's streamable HTTP transport, answered as plain JSON: the same tools as `cove mcp`, acting with the caller's key. Batches work; notifications get 202 |
 | `POST` | `/v1/pair/codes` | A one-time code, good for 10 minutes. With `--https`, also `url`, `fingerprint` and `pair`, the `cove://` line |
 | `GET` | `/v1/logins` | Each agent and whether it is signed in on this server (never the files) |
 | `PUT` · `DELETE` | `/v1/logins/{agent}` | PUT `{files: {path: base64}}` saves login files from elsewhere; DELETE signs the agent out here and in the VMs |
@@ -503,9 +513,10 @@ flowchart LR
 - [x] Agent logins: sign in once per server, refreshed tokens kept in step across VMs
 - [x] HTTPS with a self-signed certificate pinned through the pairing line (`cove serve --https`)
 - [x] Let's Encrypt certificates for your own domain or the server's bare IP (`--domain`)
+- [x] MCP over HTTP at `/v1/mcp`, for agents that can't run `cove mcp`
 - [x] `cove mcp install`: add Cove to Claude Code, Codex, Gemini CLI, Qwen Code, OpenCode and Cursor in one command
 
-**Next**, with the plan for the first three in [docs/easy-setup.md](docs/easy-setup.md)
+**Next**, with the plan in [docs/easy-setup.md](docs/easy-setup.md)
 
 - [ ] `cove connect you@server`: install, pair and connect from your laptop in one command
 - [ ] SSH from any terminal: a gateway with keys and paste-anywhere tokens
