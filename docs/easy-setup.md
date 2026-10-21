@@ -13,7 +13,7 @@ three commands and no copy and paste:
 
 ```console
 $ curl -fsSL https://raw.githubusercontent.com/deltalark/cove/main/scripts/install.sh | sh
-$ cove connect ubuntu@139.99.42.88
+$ cove connect ubuntu@203.0.113.7
   ✓ SSH works (key ~/.ssh/id_ed25519)
   ✓ Installed Cove 0.2.0 on the server (cloud-hypervisor, KVM)
   ✓ Paired: this laptop has a key of its own ("cli on anish-mbp")
@@ -42,9 +42,12 @@ curl -fsSL …/install.sh | sudo sh -s -- --domain cove.example.com
 - Saves the public URL in the server's settings, so `cove pair` prints a line you can paste
   as is: `cove login https://cove.example.com 4F7K-Q2XM`.
 - `127.0.0.1:7457` keeps working on the server itself, unchanged.
-- **No domain?** `--domain auto` uses a name made from the server's IP address, such as
-  `139-99-42-88.sslip.io`. That gives a real certificate with no DNS setup, for trying
-  Cove out. The docs should say plainly that this relies on a third-party DNS service.
+- **No domain?** Cove gets a Let's Encrypt certificate for the server's bare IP address,
+  using the short-lived profile (about 160 hours), and renews it by itself over HTTP-01 or
+  TLS-ALPN-01. No DNS and no third-party name service are involved.
+- **No public port?** Cove makes a self-signed certificate and puts its SHA-256
+  fingerprint in the `cove pair` code. The client pins that fingerprint, so the connection
+  is still checked end to end.
 - Pairing over HTTPS also fixes the weak point of pairing over plain HTTP on an open port:
   the key that comes back can't be read on the way.
 - `cove doctor` checks that the name points at this server, that ports 80 and 443 are
