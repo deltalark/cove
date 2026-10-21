@@ -2,6 +2,7 @@
 
 mod client;
 mod mcp;
+mod mcp_install;
 mod server;
 mod term;
 
@@ -304,8 +305,11 @@ enum Cmd {
         /// secrets' hosts.
         rules: Vec<String>,
     },
-    /// Run the MCP server (stdio) for agents.
-    Mcp,
+    /// Run the MCP server (stdio) for agents, or add it to an agent's settings.
+    Mcp {
+        #[command(subcommand)]
+        cmd: Option<McpCmd>,
+    },
     /// Print the client's and the server's version and the server's features.
     Version,
 }
@@ -545,6 +549,20 @@ enum SettingsCmd {
         #[arg(required = true)]
         keys: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum McpCmd {
+    /// Add Cove's MCP server to agents on this computer: claude, codex, gemini, qwen,
+    /// opencode, cursor. With none named, every one that is installed here.
+    Install {
+        agents: Vec<String>,
+        /// Show what would be run or written, and change nothing.
+        #[arg(long)]
+        print: bool,
+    },
+    /// Take Cove's MCP server out of agents' settings again.
+    Uninstall { agents: Vec<String> },
 }
 
 #[derive(Subcommand)]
@@ -1317,10 +1335,76 @@ async fn run(cli: Cli) -> Result<i32> {
                 .await?;
             show(json, &r, || print_egress(&r));
         }
-        Cmd::Mcp => mcp::serve(client()?).await?,
+        Cmd::Mcp { cmd: None } => mcp::serve(client()?).await?,
+        Cmd::Mcp { cmd: Some(cmd) } => return mcp_cmd(json, host.as_deref(), cmd),
         Cmd::Version => version(json, host).await,
     }
     Ok(0)
+}
+
+fn mcp_cmd(json: bool, host: Option<&str>, cmd: McpCmd) -> Result<i32> {
+    let (names, install, print) = match cmd {
+        McpCmd::Install { agents, print } => (agents, true, print),
+        McpCmd::Uninstall { agents } => (agents, false, false),
+    };
+    let agents: Vec<&mcp_install::Agent> = if names.is_empty() {
+        let found: Vec<_> = mcp_install::AGENTS.iter().filter(|a| a.present()).collect();
+        if found.is_empty() && !print {
+            bail!(
+                "found none of claude, codex, gemini, qwen, opencode or cursor here. \
+                 Name one to set it up anyway, or see cove mcp install --print"
+            );
+        }
+        if found.is_empty() {
+            mcp_install::AGENTS.iter().collect()
+        } else {
+            found
+        }
+    } else {
+        names
+            .iter()
+            .map(|n| mcp_install::find(n))
+            .collect::<Result<_>>()?
+    };
+    let command = mcp_install::server_command(host);
+    let mut failed = 0;
+    let mut report = Vec::new();
+    for a in agents {
+        let line = a.describe(&command);
+        let result = if print {
+            Ok(())
+        } else if install {
+            a.install(&command)
+        } else {
+            a.uninstall()
+        };
+        let ok = result.is_ok();
+        if !ok {
+            failed += 1;
+        }
+        report.push(serde_json::json!({
+            "agent": a.id,
+            "ok": ok,
+            "command": line,
+            "error": result.as_ref().err().map(|e| format!("{e:#}")),
+        }));
+        if json {
+            continue;
+        }
+        match (&result, print, install) {
+            (_, true, _) => println!("{:<12} {line}", a.name),
+            (Ok(()), _, true) => println!("✓ {}: can now make and use Cove VMs ({line})", a.name),
+            (Ok(()), _, false) => println!("✓ {}: Cove's MCP server removed", a.name),
+            (Err(e), _, _) => println!("✗ {}: {e:#}", a.name),
+        }
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if install && !print && failed == 0 {
+        println!();
+        println!("Restart a running agent to pick it up.");
+    }
+    Ok(if failed > 0 { 1 } else { 0 })
 }
 
 fn print_logins(logins: &[LoginInfo]) {

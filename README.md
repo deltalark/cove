@@ -141,7 +141,13 @@ One install line on a Mac or Linux box. No account, no per-second bill. Pair Run
 
 ## Use it from your agent
 
-`cove mcp` gives an agent tools to make VMs, run commands and background jobs, read and write files, share ports, pause and snapshot. Register it once:
+`cove mcp` gives an agent tools to make VMs, run commands and background jobs, read and write files, share ports, pause and snapshot. Register it with every agent on this computer in one go:
+
+```sh
+cove mcp install            # or name some: cove mcp install claude codex
+```
+
+It finds the agents that are installed, adds Cove the way each one expects, and leaves their other settings alone. `--print` shows what it would do, and `cove mcp uninstall` takes it out again. By hand, it's one line per agent:
 
 | Agent | Command |
 | --- | --- |
@@ -377,7 +383,8 @@ Runo checks `/v1/health` to see what a server supports, so an older Cove keeps w
 | `cove agents ls` · `login <agent> [--vm V]` · `logout <agent>` · `import <agent>` | Agent logins kept on the server for every VM |
 | `cove image ls` · `cove image pull <image> [--backend B]` | List and download base images |
 | `cove serve [--listen 127.0.0.1:7457]` · `cove doctor` · `cove key` | Run the server, check the host, print its key |
-| `cove mcp` · `cove version` | The MCP server over stdio; versions and the server's features |
+| `cove mcp` · `cove mcp install [agent...]` · `uninstall` | The MCP server over stdio; add it to or remove it from agents' settings |
+| `cove version` | Versions, and the server's features |
 
 Add `--json` to any command for machine-readable output, and `--host URL` to talk to another server. `cove exec` and `cove shell` start a stopped VM, or resume a paused one, by themselves, and with `--create` make a missing one. `cove exec` passes stdin through byte for byte, so `git upload-pack` and friends run through it unchanged.
 
@@ -501,12 +508,12 @@ flowchart LR
 - [x] Snapshots, `cove snapshot build` and a `universal` template
 - [x] Server settings, named keys and pairing codes; Runo Connections with turns that outlive your laptop
 - [x] Agent logins: sign in once per server, refreshed tokens kept in step across VMs
+- [x] `cove mcp install`: add Cove to Claude Code, Codex, Gemini CLI, Qwen Code, OpenCode and Cursor in one command
 
 **Next**, with the plan for the first three in [docs/easy-setup.md](docs/easy-setup.md)
 
 - [ ] `cove serve --domain`: HTTPS on your own domain, certificate included
 - [ ] `cove connect you@server`: install, pair and connect from your laptop in one command
-- [ ] `cove mcp install <agent>` for Claude Code, Codex, Gemini, Qwen Code, OpenCode and Cursor
 - [ ] SSH from any terminal: a gateway with keys and paste-anywhere tokens
 - [ ] Public HTTPS ports on your own domain, with wake on visit
 - [ ] Secrets stored on the server and changeable on a running VM
