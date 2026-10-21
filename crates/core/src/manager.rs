@@ -153,6 +153,8 @@ pub struct Manager {
     pub url_host: String,
     /// The egress proxy's certificate authority, loaded on first use.
     tls: std::sync::OnceLock<Arc<Tls>>,
+    /// Held while a VM's agent logins sync, so two VMs never save at once.
+    logins_lock: Mutex<()>,
 }
 
 impl Manager {
@@ -166,6 +168,7 @@ impl Manager {
             net_lock: Mutex::new(()),
             url_host: "127.0.0.1".into(),
             tls: std::sync::OnceLock::new(),
+            logins_lock: Mutex::new(()),
         }))
     }
 
@@ -447,6 +450,8 @@ impl Manager {
     /// resumed. Where the backend can, its memory goes to disk too, so a paused VM
     /// costs only disk space.
     pub async fn pause(self: &Arc<Self>, name: &str, reason: PauseReason) -> Result<VmStatus> {
+        // Hand back a token the agent refreshed before the VM freezes.
+        self.sync_logins_logged(name).await;
         let lock = self.lock(name).await;
         let _guard = lock.lock().await;
         let record = self.record(name)?;
@@ -530,6 +535,7 @@ impl Manager {
             drop(_guard);
             self.start_egress(name).await?;
             self.touch(name);
+            self.sync_logins_logged(name).await;
             return self.status(name).await;
         }
         if launch.paused.is_some() {
@@ -539,6 +545,7 @@ impl Manager {
         }
         drop(_guard);
         self.touch(name);
+        self.sync_logins_logged(name).await;
         self.status(name).await
     }
 
@@ -844,6 +851,7 @@ impl Manager {
         }
         drop(_guard);
         result?;
+        self.sync_logins_logged(name).await;
         self.status(name).await
     }
 
@@ -924,6 +932,137 @@ impl Manager {
                 .context("setting up the egress proxy")?;
         }
         Ok(())
+    }
+
+    /// Keep a running VM's agent logins in step with the ones saved on this server
+    /// (see [`crate::logins`]). Returns what changed, as `("codex", "saved")`. A VM
+    /// that is stopped, paused, opted out or on the host backend is left alone.
+    pub async fn sync_logins(&self, name: &str) -> Result<Vec<(String, &'static str)>> {
+        use crate::logins::{self, Step};
+        let record = self.record(name)?;
+        let dir = self.paths.vm_dir(name);
+        let running = Launch::load(&dir).filter(|l| l.alive() && l.paused.is_none());
+        // The host backend's "guest" is this machine: its home folder isn't a VM's.
+        let (Some(launch), true) = (
+            running,
+            record.spec.logins && record.spec.backend != backend::HOST,
+        ) else {
+            return Ok(Vec::new());
+        };
+        let guest = launch.guest;
+        let ask = Duration::from_secs(10);
+        let _guard = self.logins_lock.lock().await;
+        let mut seen = logins::load_seen(&dir);
+        let mut done = Vec::new();
+        for agent in logins::AGENTS.iter() {
+            let mut saved = logins::load(&self.paths, agent.id);
+            let mut saved_changed = false;
+            let agent_seen = seen.entry(agent.id.to_string()).or_default();
+            for file in agent.files {
+                let path = format!("{}/{file}", logins::GUEST_HOME);
+                let in_vm = match tokio::time::timeout(
+                    ask,
+                    guest.call(&Request::ReadFile { path: path.clone() }),
+                )
+                .await
+                {
+                    Ok(Ok(v)) => match serde_json::from_value::<cove_proto::Bytes>(v) {
+                        Ok(b) => Some(b.0),
+                        Err(_) => continue,
+                    },
+                    Ok(Err(e)) if missing(&e) => None,
+                    // Can't tell what the VM has: leave both sides alone.
+                    _ => continue,
+                };
+                let stored = saved
+                    .as_ref()
+                    .and_then(|s| s.files.get(*file))
+                    .map(|b| b.0.clone());
+                let last = agent_seen.get(*file).cloned();
+                let now_in_vm =
+                    match logins::decide(in_vm.as_deref(), stored.as_deref(), last.as_deref()) {
+                        Step::Keep => in_vm,
+                        Step::Save => {
+                            let data = in_vm.unwrap_or_default();
+                            saved
+                                .get_or_insert_with(Default::default)
+                                .files
+                                .insert(file.to_string(), data.clone().into());
+                            saved_changed = true;
+                            Some(data)
+                        }
+                        Step::Push => {
+                            let data = stored.unwrap_or_default();
+                            let wrote = tokio::time::timeout(
+                                ask,
+                                guest.call(&Request::WriteFile {
+                                    path: path.clone(),
+                                    data: data.clone().into(),
+                                    mode: Some(0o600),
+                                }),
+                            )
+                            .await;
+                            if !matches!(wrote, Ok(Ok(_))) {
+                                continue;
+                            }
+                            done.push((agent.id.to_string(), "given"));
+                            Some(data)
+                        }
+                        Step::Remove => {
+                            let removed = tokio::time::timeout(
+                                ask,
+                                guest.exec(cove_proto::Command {
+                                    cmd: vec!["rm".into(), "-f".into(), path.clone()],
+                                    ..Default::default()
+                                }),
+                            )
+                            .await;
+                            if !matches!(removed, Ok(Ok(ref o)) if o.code == Some(0)) {
+                                continue;
+                            }
+                            done.push((agent.id.to_string(), "removed"));
+                            None
+                        }
+                    };
+                match now_in_vm {
+                    Some(data) => {
+                        agent_seen.insert(file.to_string(), logins::digest(&data));
+                    }
+                    None => {
+                        agent_seen.remove(*file);
+                    }
+                }
+            }
+            if let (true, Some(saved)) = (saved_changed, saved.as_mut()) {
+                saved.updated_at = crate::now();
+                saved.from = name.to_string();
+                logins::save(&self.paths, agent.id, saved)?;
+                done.push((agent.id.to_string(), "saved"));
+            }
+        }
+        seen.retain(|_, files| !files.is_empty());
+        logins::save_seen(&dir, &seen)?;
+        done.dedup();
+        Ok(done)
+    }
+
+    /// [`Manager::sync_logins`], saying what changed or went wrong on stderr.
+    pub async fn sync_logins_logged(&self, name: &str) {
+        match self.sync_logins(name).await {
+            Ok(done) => {
+                for (agent, what) in done {
+                    eprintln!("{name}: {agent} login {what}");
+                }
+            }
+            Err(e) => eprintln!("{name}: syncing agent logins failed: {e:#}"),
+        }
+    }
+
+    /// Sync the agent logins of every running VM.
+    pub async fn sync_all_logins(&self) {
+        for name in self.names() {
+            self.sync_logins_logged(&name).await;
+        }
     }
 
     fn tls(&self) -> Result<Arc<Tls>> {
@@ -1108,6 +1247,7 @@ impl Manager {
     }
 
     pub async fn stop(self: &Arc<Self>, name: &str) -> Result<VmStatus> {
+        self.sync_logins_logged(name).await;
         let lock = self.lock(name).await;
         let _guard = lock.lock().await;
         let record = self.record(name)?;
@@ -1300,6 +1440,12 @@ impl Manager {
 }
 
 /// Idle timers take at least a minute; `None` means no timer.
+/// Whether a guest error says the file isn't there.
+fn missing(e: &anyhow::Error) -> bool {
+    let text = format!("{e:#}");
+    text.contains("No such file") || text.contains("os error 2")
+}
+
 fn check_minutes(minutes: Option<u64>, what: &str) -> Result<()> {
     if minutes == Some(0) {
         bail!("{what} takes at least 1 minute (leave it out, or null, for none)");

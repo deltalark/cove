@@ -6,7 +6,7 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use cove_core::model::VmSpec;
 use cove_core::{image, Manager};
@@ -83,6 +83,9 @@ pub fn router(manager: Arc<Manager>, key: String) -> Router {
         .route("/keys", get(keys).post(create_key))
         .route("/keys/{id}", delete(remove_key))
         .route("/pair/codes", post(pair_code))
+        .route("/logins", get(logins))
+        .route("/logins/{agent}", put(import_login).delete(remove_login))
+        .route("/vms/{name}/logins/sync", post(sync_logins))
         .route("/vms/{name}/exec", post(exec))
         .route("/vms/{name}/stream", get(stream))
         .route("/vms/{name}/procs", get(procs))
@@ -144,6 +147,7 @@ pub const FEATURES: &[&str] = &[
     "pause",
     "auto-pause",
     "timeout",
+    "logins",
     "labels",
     "rename",
     "snapshots",
@@ -359,6 +363,53 @@ async fn set_settings(
 ) -> ApiResult<cove_core::settings::Settings> {
     settings.save(&app.manager.paths)?;
     Ok(Json(settings))
+}
+
+async fn logins(State(app): State<App>) -> Json<Vec<cove_core::logins::LoginInfo>> {
+    Json(cove_core::logins::list(&app.manager.paths))
+}
+
+#[derive(Deserialize)]
+struct LoginBody {
+    /// File path from the home folder to its content, base64.
+    files: std::collections::BTreeMap<String, cove_proto::Bytes>,
+}
+
+/// Save an agent's login files from elsewhere (another computer's login).
+async fn import_login(
+    State(app): State<App>,
+    Path(agent): Path<String>,
+    Json(body): Json<LoginBody>,
+) -> ApiResult<Vec<cove_core::logins::LoginInfo>> {
+    cove_core::logins::import(&app.manager.paths, &agent, body.files)?;
+    sync_all_soon(&app);
+    Ok(logins(State(app)).await)
+}
+
+/// Sign an agent out on this server: its files go, from every running VM too.
+async fn remove_login(
+    State(app): State<App>,
+    Path(agent): Path<String>,
+) -> ApiResult<serde_json::Value> {
+    let removed = cove_core::logins::remove(&app.manager.paths, &agent)?;
+    sync_all_soon(&app);
+    Ok(Json(
+        serde_json::json!({ "agent": agent, "removed": removed }),
+    ))
+}
+
+/// Sync one VM's logins now, as after someone signed in there.
+async fn sync_logins(
+    State(app): State<App>,
+    Path(name): Path<String>,
+) -> ApiResult<Vec<cove_core::logins::LoginInfo>> {
+    app.manager.sync_logins(&name).await?;
+    Ok(logins(State(app)).await)
+}
+
+fn sync_all_soon(app: &App) {
+    let manager = app.manager.clone();
+    tokio::spawn(async move { manager.sync_all_logins().await });
 }
 
 async fn keys(State(app): State<App>) -> Json<Vec<cove_core::keys::KeyInfo>> {
@@ -741,6 +792,8 @@ async fn check_timers(manager: Arc<Manager>) {
         for (name, what) in manager.check_timers(minute).await {
             eprintln!("{name}: {what}");
         }
+        // Tokens agents refreshed reach the other VMs.
+        manager.sync_all_logins().await;
     }
 }
 
