@@ -100,6 +100,7 @@ pub fn router(manager: Arc<Manager>, key: String, public: Option<Arc<Public>>) -
         .route("/keys", get(keys).post(create_key))
         .route("/keys/{id}", delete(remove_key))
         .route("/pair/codes", post(pair_code))
+        .route("/mcp", post(mcp_http).get(mcp_no_stream))
         .route("/logins", get(logins))
         .route("/logins/{agent}", put(import_login).delete(remove_login))
         .route("/vms/{name}/logins/sync", post(sync_logins))
@@ -123,6 +124,62 @@ pub fn router(manager: Arc<Manager>, key: String, public: Option<Arc<Public>>) -
         .route("/v1/pair", post(pair))
         .nest("/v1", api)
         .with_state(app)
+}
+
+/// Like [`router`], with MCP over HTTP calling back into the server at `local_url`.
+pub fn router_at(
+    manager: Arc<Manager>,
+    key: String,
+    public: Option<Arc<Public>>,
+    local_url: &str,
+) -> Router {
+    let app = router(manager, key, public);
+    LOCAL_URL.get_or_init(|| local_url.to_string());
+    app
+}
+
+static LOCAL_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// MCP's streamable HTTP transport, answering each POST with plain JSON: the same tools
+/// as `cove mcp`, for agents that can't run it, such as hosted ones. Each tool call
+/// goes back through the API with the caller's own key, so it can do exactly what that
+/// key can, and nothing that MCP over stdio couldn't.
+async fn mcp_http(headers: HeaderMap, Json(body): Json<serde_json::Value>) -> Response {
+    let Some(url) = LOCAL_URL.get() else {
+        return ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "MCP isn't available".into(),
+        )
+        .into_response();
+    };
+    let key = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    let client = crate::client::Client::with_key(url, key);
+    let reply = match &body {
+        serde_json::Value::Array(batch) => {
+            let mut out = Vec::new();
+            for request in batch {
+                if let Some(r) = crate::mcp::handle(&client, request).await {
+                    out.push(r);
+                }
+            }
+            (!out.is_empty()).then_some(serde_json::Value::Array(out))
+        }
+        request => crate::mcp::handle(&client, request).await,
+    };
+    match reply {
+        Some(v) => Json(v).into_response(),
+        // Notifications and responses get no reply.
+        None => StatusCode::ACCEPTED.into_response(),
+    }
+}
+
+/// No server-sent events: every answer comes back on its own POST.
+async fn mcp_no_stream() -> StatusCode {
+    StatusCode::METHOD_NOT_ALLOWED
 }
 
 async fn auth(
@@ -172,6 +229,7 @@ pub const FEATURES: &[&str] = &[
     "keys",
     "pair",
     "https",
+    "mcp-http",
 ];
 
 /// Also lists `backend:<name>` for each backend that can run VMs here, and the one
@@ -869,7 +927,7 @@ pub async fn serve(manager: Arc<Manager>, listen: &str, https: Option<HttpsOptio
     tokio::spawn(check_timers(manager.clone()));
     // VMs that kept running while the server was down need their proxies back.
     manager.restart_proxies().await;
-    let app = router(manager, key, public);
+    let app = router_at(manager, key, public, &url);
     match tls {
         Some(tls) => {
             let plain =

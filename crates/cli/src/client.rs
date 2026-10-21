@@ -49,6 +49,17 @@ impl Client {
         })
     }
 
+    /// A client for a plain-HTTP server with this key, such as `cove serve` calling
+    /// its own loopback listener.
+    pub fn with_key(url: &str, key: &str) -> Client {
+        Client {
+            url: url.trim_end_matches('/').to_string(),
+            key: key.to_string(),
+            http: reqwest::Client::new(),
+            fingerprint: None,
+        }
+    }
+
     fn endpoint(&self, path: &str) -> String {
         format!("{}/v1{path}", self.url)
     }
