@@ -8,6 +8,7 @@ mod term;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use client::Client;
+use cove_core::logins::LoginInfo;
 use cove_core::manager::EgressReport;
 use cove_core::model::{Mount, Secret, TimeoutAction};
 use cove_core::paths::Paths;
@@ -200,6 +201,10 @@ enum Cmd {
     /// Named API keys: one per person or device, each revocable.
     #[command(subcommand)]
     Keys(KeysCmd),
+    /// Agent logins kept on the server: sign in to Claude Code, Codex, Gemini or
+    /// OpenCode once, and every VM is signed in.
+    #[command(subcommand)]
+    Agents(AgentsCmd),
     /// Delete a VM and its disk.
     Rm {
         name: String,
@@ -336,6 +341,9 @@ struct Ensure {
     /// With --create: start from this snapshot.
     #[arg(skip)]
     snapshot: Option<String>,
+    /// With --create: don't give the VM the agent logins saved on the server.
+    #[arg(long)]
+    no_logins: bool,
 }
 
 /// Where a new VM may connect, and the secrets Cove adds for it.
@@ -439,6 +447,9 @@ async fn ensure_running(client: &Client, name: &str, ensure: &Ensure) -> Result<
             put(&mut body, "idle_stop_minutes", ensure.idle_stop);
             put(&mut body, "auto_pause_minutes", ensure.auto_pause);
             put(&mut body, "snapshot", ensure.snapshot.clone());
+            if ensure.no_logins {
+                body["logins"] = serde_json::json!(false);
+            }
             if !allow.is_empty() {
                 body["allow"] = serde_json::json!(allow);
             }
@@ -534,6 +545,29 @@ enum SettingsCmd {
         #[arg(required = true)]
         keys: Vec<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum AgentsCmd {
+    /// Which agents are signed in on the server.
+    Ls,
+    /// Sign an agent in: runs its login in a VM's terminal, then keeps the login on
+    /// the server for every VM.
+    Login {
+        /// claude, codex, gemini, opencode or qwen.
+        agent: String,
+        /// The VM to sign in from; created if it doesn't exist.
+        #[arg(long, default_value = "cove-login")]
+        vm: String,
+        /// Run this instead of the agent's own login command (it gets a terminal).
+        #[arg(trailing_var_arg = true)]
+        cmd: Vec<String>,
+    },
+    /// Sign an agent out: the server and its VMs forget the login.
+    Logout { agent: String },
+    /// Copy this computer's login for an agent to the server (from ~/.codex/auth.json
+    /// and the like). A Mac keeps Claude Code's in the keychain: use login instead.
+    Import { agent: String },
 }
 
 #[derive(Subcommand)]
@@ -810,6 +844,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 idle_stop: None,
                 auto_pause: None,
                 snapshot,
+                no_logins: false,
             };
             let client = client()?;
             ensure_running(&client, &name, &ensure).await?;
@@ -1101,6 +1136,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 }
             }
         }
+        Cmd::Agents(cmd) => return agents_cmd(&client()?, json, cmd).await,
         Cmd::Show { name } => {
             let vm: VmStatus = client()?.get(&format!("/vms/{name}")).await?;
             println!("{}", serde_json::to_string_pretty(&vm)?);
@@ -1283,6 +1319,155 @@ async fn run(cli: Cli) -> Result<i32> {
         }
         Cmd::Mcp => mcp::serve(client()?).await?,
         Cmd::Version => version(json, host).await,
+    }
+    Ok(0)
+}
+
+fn print_logins(logins: &[LoginInfo]) {
+    for l in logins {
+        let state = if l.signed_in {
+            let from = match l.from.as_str() {
+                "" => String::new(),
+                "import" => ", copied from another computer".into(),
+                vm => format!(", from VM {vm}"),
+            };
+            format!("signed in{from}")
+        } else {
+            format!("not signed in: cove agents login {}", l.agent)
+        };
+        println!("{:<10} {:<12} {state}", l.agent, l.name);
+    }
+}
+
+async fn agents_cmd(client: &Client, json: bool, cmd: AgentsCmd) -> Result<i32> {
+    use cove_core::logins;
+    let known = || {
+        logins::AGENTS
+            .iter()
+            .map(|a| a.id)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match cmd {
+        AgentsCmd::Ls => {
+            let all: Vec<LoginInfo> = client.get("/logins").await?;
+            show(json, &all, || print_logins(&all));
+        }
+        AgentsCmd::Login { agent, vm, cmd } => {
+            let Some(a) = logins::agent(&agent) else {
+                bail!("Cove keeps logins for {}, not {agent:?}", known());
+            };
+            let ensure = Ensure {
+                create: true,
+                mounts: Vec::new(),
+                cpus: None,
+                memory: None,
+                backend: std::env::var("COVE_BACKEND").ok(),
+                network: None,
+                egress: EgressArgs {
+                    allow: Vec::new(),
+                    secrets: Vec::new(),
+                },
+                idle_stop: Some(15),
+                auto_pause: None,
+                snapshot: None,
+                no_logins: false,
+            };
+            ensure_running(client, &vm, &ensure).await?;
+            // A VM that was running already catches up first.
+            client
+                .post::<Vec<LoginInfo>>(&format!("/vms/{vm}/logins/sync"), &())
+                .await?;
+            // A command of its own installs what it needs itself.
+            let command = if cmd.is_empty() {
+                eprintln!("Signing in to {} in VM {vm}. {}", a.name, a.hint);
+                let mut c = vec![
+                    "bash".to_string(),
+                    "-lc".into(),
+                    a.login_script(),
+                    "cove".into(),
+                ];
+                c.extend(a.login.iter().map(|s| s.to_string()));
+                c
+            } else {
+                cmd
+            };
+            let request = Request::Exec(GuestCommand {
+                cmd: command,
+                cwd: Some(logins::GUEST_HOME.into()),
+                env: a
+                    .login_env
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                pty: Some(term::size()),
+            });
+            let code = term::run(client, &vm, request).await?;
+            let all: Vec<LoginInfo> = client.post(&format!("/vms/{vm}/logins/sync"), &()).await?;
+            let signed_in = all.iter().any(|l| l.agent == a.id && l.signed_in);
+            show(json, &all, || {
+                if signed_in {
+                    println!(
+                        "{} is signed in on this server. Every VM gets this login, and refreshed tokens come back.",
+                        a.name
+                    );
+                } else {
+                    println!(
+                        "{} didn't save a login in {vm} ({} not found). Run cove agents login {} to try again.",
+                        a.name,
+                        a.files[0],
+                        a.id
+                    );
+                }
+            });
+            return Ok(if signed_in {
+                0
+            } else if code != 0 {
+                code
+            } else {
+                1
+            });
+        }
+        AgentsCmd::Logout { agent } => {
+            let v: serde_json::Value = client.delete(&format!("/logins/{agent}")).await?;
+            show(json, &v, || {
+                if v["removed"].as_bool() == Some(true) {
+                    println!("Signed out of {agent} on this server and its VMs.");
+                } else {
+                    println!("{agent} wasn't signed in on this server.");
+                }
+            });
+        }
+        AgentsCmd::Import { agent } => {
+            let Some(a) = logins::agent(&agent) else {
+                bail!("Cove keeps logins for {}, not {agent:?}", known());
+            };
+            let home = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
+            let mut files = std::collections::BTreeMap::new();
+            for f in a.files {
+                if let Ok(data) = std::fs::read(home.join(f)) {
+                    files.insert(f.to_string(), cove_proto::Bytes(data));
+                }
+            }
+            if !files.contains_key(a.files[0]) {
+                bail!(
+                    "this computer has no ~/{} to copy; sign in on the server with cove agents login {}",
+                    a.files[0],
+                    a.id
+                );
+            }
+            let all: Vec<LoginInfo> = client
+                .put(
+                    &format!("/logins/{}", a.id),
+                    &serde_json::json!({ "files": files }),
+                )
+                .await?;
+            show(json, &all, || {
+                println!("Copied {}'s login to the server. Every VM gets it.", a.name)
+            });
+        }
     }
     Ok(0)
 }

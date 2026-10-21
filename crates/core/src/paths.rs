@@ -12,6 +12,8 @@
 //! snapshots/<name>/        a saved VM: snapshot.json and disk.raw (or rootfs/)
 //! settings.json           server defaults for new VMs (`/v1/settings`)
 //! keys.json               named API keys, hashed (`cove keys`, pairing)
+//! logins/<agent>.json     agents' saved login files (`cove agents`, mode 600)
+//! vms/<name>/logins.json  hashes of the login files that VM had at its last sync
 //! login.json              this client's saved server (`cove login`)
 //! guest/cove-guest-<arch>  guest agent binaries copied into VMs
 //! firmware/CLOUDHV*.fd    cloud-hypervisor's EFI firmware (Linux)
@@ -70,6 +72,9 @@ impl Paths {
     }
     pub fn keys_file(&self) -> PathBuf {
         self.root.join("keys.json")
+    }
+    pub fn logins_dir(&self) -> PathBuf {
+        self.root.join("logins")
     }
     pub fn login_file(&self) -> PathBuf {
         self.root.join("login.json")

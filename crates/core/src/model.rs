@@ -66,6 +66,14 @@ pub struct VmSpec {
     /// Pause or delete the VM at a set time. Used once: it is cleared when it fires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<Timeout>,
+    /// Keep the agents' logins saved on this server (`cove agents`) in step with the
+    /// VM: it gets them when it starts and hands refreshed ones back.
+    #[serde(default = "yes")]
+    pub logins: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// A one-off deadline for a VM.
@@ -244,6 +252,7 @@ impl Default for VmSpec {
             labels: BTreeMap::new(),
             snapshot: None,
             timeout: None,
+            logins: true,
         }
     }
 }

@@ -225,6 +225,27 @@ Runo checks `/v1/health` to see what a server supports, so an older Cove keeps w
 
 On Linux, VMs with the network on get their own /30 in `10.177.0.0/16` with NAT to the internet. They can't reach each other, the host's own services, or the cloud metadata endpoint (`169.254.0.0/16`), which on many providers hands out the server's credentials. gVisor sandboxes boot in about a second and need no KVM, but don't enforce `--disk` and have no systemd inside.
 
+## Agent logins
+
+Sign in to an agent once per server, and every VM is signed in:
+
+```console
+$ cove agents login claude
+Signing in to Claude Code in VM cove-login. Pick a login method, open the link it shows on any device and paste the code back here.
+…
+Claude Code is signed in on this server. Every VM gets this login, and refreshed tokens come back.
+$ cove agents ls
+claude     Claude Code  signed in, from VM cove-login
+codex      Codex        not signed in: cove agents login codex
+```
+
+- **Each agent CLI keeps its login in files in the home folder**: `~/.claude/.credentials.json` for Claude Code, `~/.codex/auth.json` for Codex, `~/.gemini/` for Gemini, `~/.local/share/opencode/auth.json` for OpenCode, `~/.qwen/` for Qwen Code. Cove keeps a copy of each on the server, in `~/.cove/logins/`, readable only by Cove.
+- **Every VM gets them when it starts**, and Cove checks running VMs every 30 seconds and when they pause or stop. A login made or refreshed in any VM is saved and reaches the others, so a token that rotates doesn't sign the rest out. Signing in inside any VM counts too.
+- **`cove agents logout <agent>`** forgets the login and removes it from the VMs. `cove agents import <agent>` copies this computer's login files to the server instead (a Mac keeps Claude Code's in the keychain, so sign in on the server for that one).
+- **Opt a VM out** with `--no-logins` on `cove up` or `cove exec --create`.
+
+These are the agents' own files, so the agent in a VM can read them, unlike `--secret` keys, which never enter it. Use secrets for API keys when that matters.
+
 ## Secrets and the allowlist
 
 ```console
@@ -280,6 +301,7 @@ On purpose, MCP can't give a VM secrets or change its allowlist: an agent should
 | `cove settings show` · `set K=V...` · `unset K...` | The server's defaults for new VMs |
 | `cove pair` · `cove login <url> <code>` · `cove logout` | Connect Runo or another computer with a one-time code |
 | `cove keys ls` · `create <name>` · `rm <id>` | Named API keys, one per person or device |
+| `cove agents ls` · `login <agent> [--vm V]` · `logout <agent>` · `import <agent>` | Agent logins kept on the server for every VM |
 | `cove image ls` · `cove image pull <image> [--backend B]` | List and download base images |
 | `cove serve [--listen 127.0.0.1:7457]` · `cove doctor` · `cove key` | Run the server, check the host, print its key |
 | `cove mcp` · `cove version` | The MCP server over stdio; versions and the server's features |
@@ -330,6 +352,9 @@ Every request carries `Authorization: Bearer <key>`: the server's own key (`cove
 | `GET` `PUT` | `/v1/settings` | Defaults for new VMs: `cpus, memory_mb, disk_gb, backend, network, allow, auto_pause_minutes, idle_stop_minutes, snapshot` |
 | `GET` `POST` · `DELETE` | `/v1/keys` · `/v1/keys/{id}` | POST `{name}` returns a new key once |
 | `POST` | `/v1/pair/codes` | A one-time code, good for 10 minutes |
+| `GET` | `/v1/logins` | Each agent and whether it is signed in on this server (never the files) |
+| `PUT` · `DELETE` | `/v1/logins/{agent}` | PUT `{files: {path: base64}}` saves login files from elsewhere; DELETE signs the agent out here and in the VMs |
+| `POST` | `/v1/vms/{name}/logins/sync` | Sync that VM's logins now, as after signing in there |
 | `POST` | `/v1/pair` | No auth. `{code, name}` returns `{id, name, key, server}`. Ten wrong codes in a row lock pairing for 10 minutes |
 | `GET` · `POST` | `/v1/images` · `/v1/images/{name}/pull?backend=` | |
 
@@ -402,6 +427,7 @@ flowchart LR
 - [x] Pause and resume, to disk on Linux; auto-pause with wake on use; timeouts, labels and rename
 - [x] Snapshots, `cove snapshot build` and a `universal` template
 - [x] Server settings, named keys and pairing codes; Runo Connections with turns that outlive your laptop
+- [x] Agent logins: sign in once per server, refreshed tokens kept in step across VMs
 
 **Next**
 

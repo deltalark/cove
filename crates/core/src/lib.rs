@@ -9,6 +9,7 @@ pub mod guest;
 pub mod gvisor;
 pub mod image;
 pub mod keys;
+pub mod logins;
 pub mod manager;
 pub mod model;
 pub mod paths;
