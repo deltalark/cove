@@ -1124,11 +1124,12 @@ async fn run(cli: Cli) -> Result<i32> {
         } => {
             let target = client::parse_pair_target(&url, code.as_deref(), fingerprint.as_deref())?;
             let (url, code, fingerprint) = (target.url, target.code, target.fingerprint);
+            // Key names hold up to 64 characters, and some host names (CI runners')
+            // are longer.
             let name = name.unwrap_or_else(|| {
-                format!(
-                    "cli on {}",
-                    hostname().unwrap_or_else(|| "a computer".into())
-                )
+                let host = hostname().unwrap_or_else(|| "a computer".into());
+                let host = host.split('.').next().unwrap_or(&host).to_string();
+                format!("cli on {host}").chars().take(64).collect()
             });
             let v = client::pair(&url, &code, &name, fingerprint.as_deref()).await?;
             let key = v["key"].as_str().unwrap_or_default().to_string();
