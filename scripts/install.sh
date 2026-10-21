@@ -259,6 +259,17 @@ download_release() {
   install_tarball "$tmp/$asset"
 }
 
+# Install a distribution package if its program is missing.
+pkg_install() {
+  if have apt-get; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" >/dev/null
+  elif have dnf; then
+    dnf install -y -q "$@"
+  else
+    return 1
+  fi
+}
+
 build_from_source() {
   have cargo || die "building from source needs Rust: https://rustup.rs"
   # Run from a checkout (scripts/install.sh), build that; piped from curl, clone.
@@ -282,10 +293,37 @@ build_from_source() {
   (cd "$src" && cargo build --release -p cove)
   place "$src/target/release/cove" cove
   # VMs need the guest agent as a static Linux binary for this processor.
-  if [ "$os" = Linux ] && have musl-gcc || have cargo-zigbuild; then
+  guest_toolchain
+  if { [ "$os" = Linux ] && have musl-gcc; } || have cargo-zigbuild; then
     (cd "$src" && COVE_HOME="$data" sh scripts/build-guest.sh)
   else
-    warn "skipped the guest agent VMs need: install zig and cargo-zigbuild, then run scripts/build-guest.sh"
+    warn "skipped the guest agent VMs need: install zig and cargo-zigbuild (or musl-tools on Linux), then run scripts/build-guest.sh"
+  fi
+}
+
+# What building the guest agent needs: musl-gcc on Linux, zig and cargo-zigbuild
+# on a Mac. Installed unless --no-deps.
+guest_toolchain() {
+  [ "$deps" = 1 ] || return 0
+  if [ "$os" = Linux ]; then
+    if ! have musl-gcc && [ "$(id -u)" = 0 ]; then
+      say "Installing musl-tools to build the guest agent"
+      if have apt-get; then
+        apt-get update -qq >/dev/null || true
+      fi
+      pkg_install musl-tools || pkg_install musl-gcc || true
+    fi
+    return 0
+  fi
+  if ! have cargo-zigbuild; then
+    if ! have zig && have brew; then
+      say "Installing zig with Homebrew to build the guest agent"
+      brew install zig >/dev/null || true
+    fi
+    if have zig; then
+      say "Installing cargo-zigbuild"
+      cargo install --quiet --locked cargo-zigbuild || true
+    fi
   fi
 }
 
@@ -318,16 +356,6 @@ for dir in $([ "$link" = 1 ] && link_dirs); do
   fi
 done
 
-# Install a distribution package if its program is missing.
-pkg_install() {
-  if have apt-get; then
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" >/dev/null
-  elif have dnf; then
-    dnf install -y -q "$@"
-  else
-    return 1
-  fi
-}
 
 # Debian and Ubuntu put virtiofsd outside PATH.
 have_virtiofsd() {
