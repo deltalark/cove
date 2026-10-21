@@ -1,30 +1,44 @@
 <div align="center">
 
-# Cove
+<a href="https://github.com/deltalark/cove">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
+    <img alt="Cove" src="docs/assets/logo-light.svg" width="380">
+  </picture>
+</a>
 
-### Your own cloud computers for coding agents.
+<h3>Let your coding agents run anything, on a machine they can't break.</h3>
 
-Real Linux VMs that boot in seconds, pause to disk, snapshot while running and keep your keys out of reach.<br/>
-On your Mac, your server or a $10 VPS. Driven from a CLI, an HTTP API, MCP or [Runo](https://github.com/deltalark/runo).
+Real Linux VMs that boot in seconds, pause to disk, snapshot while running and never hold your API keys.<br/>
+On your Mac or your own server. Works with Claude Code, Codex, Cursor, Gemini CLI, OpenCode, <a href="https://github.com/deltalark/runo">Runo</a> and any MCP client.
 
-[![CI](https://github.com/deltalark/cove/actions/workflows/ci.yml/badge.svg)](https://github.com/deltalark/cove/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Rust](https://img.shields.io/badge/built%20with-Rust-b7410e?logo=rust&logoColor=white)
-![macOS · Apple Silicon](https://img.shields.io/badge/macOS-Apple%20Silicon-lightgrey?logo=apple)
-![Linux · KVM or gVisor](https://img.shields.io/badge/Linux-KVM%20or%20gVisor-lightgrey?logo=linux&logoColor=white)
-![Status: early](https://img.shields.io/badge/status-early-orange)
+<p>
+  <a href="https://github.com/deltalark/cove/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/deltalark/cove/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-0ea5a4"></a>
+  <img alt="Single Rust binary" src="https://img.shields.io/badge/single%20binary-Rust-b7410e?logo=rust&logoColor=white">
+  <img alt="macOS and Linux" src="https://img.shields.io/badge/runs%20on-macOS%20%C2%B7%20Linux-2563eb">
+  <img alt="Status: early" src="https://img.shields.io/badge/status-early-f59e0b">
+</p>
 
-[Install](#install) · [Tour](#a-quick-tour) · [With Runo](#cove-and-runo) · [Where it runs](#where-cove-runs) · [Secrets](#secrets-and-the-allowlist) · [Reference](#reference) · [How it works](#how-it-works) · [Roadmap](#roadmap)
+<p>
+  <a href="#get-started"><b>Get started</b></a> ·
+  <a href="#use-it-with-your-agent"><b>Use with your agent</b></a> ·
+  <a href="#a-quick-tour">Tour</a> ·
+  <a href="#secrets-and-the-allowlist">Secrets</a> ·
+  <a href="#reference">Reference</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="#roadmap">Roadmap</a>
+</p>
+
+<br/>
+
+<img alt="A terminal session: install Cove, add it to Claude Code, start a VM with brokered secrets and an egress allowlist, and read its network log" src="docs/assets/hero.svg" width="100%">
 
 </div>
 
-```console
-$ curl -fsSL https://raw.githubusercontent.com/deltalark/cove/main/scripts/install.sh | sh
-$ cove sh
-root@dev:~# cargo test
-```
+<br/>
 
-Coding agents are most useful when you let them run anything, and most dangerous for the same reason. Cove gives every agent, and every person, a real Linux machine of its own: it boots in seconds, keeps its state, sees only the folders you share, reaches only the hosts you allow, and never holds your API keys.
+Coding agents are most useful when you let them run anything, and most dangerous for the same reason. Cove gives every agent, and every person, a real Linux machine of its own: it boots in seconds, keeps its state, sees only the folders you share, reaches only the hosts you allow, and never holds your API keys. It is one open-source binary you run yourself, with no account and no per-second bill.
 
 ## Why Cove
 
@@ -87,42 +101,51 @@ One install line on a Mac or Linux box. No account, no per-second bill. Pair Run
 </tr>
 </table>
 
-## Install
+## How Cove compares
 
-<table>
-<tr>
-<th align="left">On a Mac (Apple Silicon)</th>
-<th align="left">On a Linux server or VPS</th>
-</tr>
-<tr>
-<td valign="top">
+Cove sits between hosted sandbox APIs and local agent jails: a real VM, on hardware you own, that keeps running when your laptop closes.
+
+| | **Cove** | Docker Sandboxes | Hosted sandboxes (E2B, Daytona, Modal) | Cloud computers (exe.dev, Sprites) |
+| --- | :---: | :---: | :---: | :---: |
+| Open source, self-hosted | ✓ MIT, one binary | Closed source | Some, as a cluster | Hosted |
+| Runs on your Mac and your VPS | ✓ | Local | Their cloud | Their cloud |
+| Real VM with its own kernel | ✓ (or gVisor) | ✓ | Varies | ✓ |
+| Keys never enter the sandbox | ✓ | ✓ | Some | Some |
+| Egress allowlist with a log | ✓ | ✓ | ✓ | Some |
+| Pause to disk, snapshot while running | ✓ | | Some | ✓ |
+| Work that outlives your laptop | ✓ | | ✓ | ✓ |
+| Price | Your hardware | Free locally | Per second | Monthly or per second |
+
+## Get started
+
+**1. Install.** One line on a Mac (Apple Silicon) or any Linux server, even a $10 VPS without KVM.
 
 ```sh
+# Mac
 curl -fsSL https://raw.githubusercontent.com/deltalark/cove/main/scripts/install.sh | sh
-```
-
-Installs vfkit with Homebrew if needed and starts `cove serve` at login.
-
-</td>
-<td valign="top">
-
-```sh
+# Linux server or VPS (root, because VMs with a network need it)
 curl -fsSL https://raw.githubusercontent.com/deltalark/cove/main/scripts/install.sh | sudo sh
 ```
 
-Root, because VMs with a network need it. Installs cloud-hypervisor with KVM, or gVisor without it, and a systemd service.
+The script picks the backend (vfkit on a Mac, cloud-hypervisor with KVM, gVisor without it), installs a launchd agent or a systemd service, and pulls the Debian 13 image. `cove doctor` then says what each backend needs and what is missing.
 
-</td>
-</tr>
-</table>
+**2. Open a machine.**
 
-Then check the machine with `cove doctor`, which lists what each backend needs, what is missing and how to fix it.
+```sh
+cove sh                     # makes a VM called "dev" and opens a root shell in it
+```
+
+**3. Hand it to your agent.** One command adds Cove's MCP server, so your agent can make its own VMs, run code in them, pause and snapshot them. See [Use it with your agent](#use-it-with-your-agent).
+
+```sh
+claude mcp add cove -- cove mcp
+```
 
 <details>
 <summary><b>What the install script does, and its options</b></summary>
 
 - Puts `cove` and the guest agent in `~/.cove/bin`, from the latest release, or builds them from source with cargo when no release fits. Building from source needs [Rust](https://rustup.rs); the script fetches the rest for the guest agent (zig and cargo-zigbuild on a Mac, musl-tools on Linux).
-- Links `cove` into `/opt/homebrew/bin` or `/usr/local/bin`, so apps such as Runo find it.
+- Links `cove` into `/opt/homebrew/bin` or `/usr/local/bin`, so agents and apps find it.
 - **Mac:** installs vfkit with Homebrew if it is missing, and starts `cove serve` at login with a launchd agent.
 - **Linux with KVM:** installs cloud-hypervisor (the official static build), and virtiofsd, iptables and iproute2 from your distribution.
 - **Linux without KVM:** asks to install gVisor (the official release, checksum checked). Say no and you get just the CLI, to drive a Cove server elsewhere.
@@ -133,6 +156,37 @@ Running it again upgrades in place; your VMs, images and keys in `~/.cove` are l
 **Uninstall** with `--uninstall`. It stops the service and removes the binaries and keeps `~/.cove`; add `--purge` to stop every VM and delete `~/.cove` too.
 
 </details>
+
+## Use it with your agent
+
+Cove speaks MCP over stdio with `cove mcp`. Add it once, and the agent gets tools to create VMs, run commands and background jobs, move files, share ports, pause and snapshot.
+
+<table>
+<tr><th align="left">Agent</th><th align="left">Add Cove</th></tr>
+<tr><td><b>Claude Code</b></td><td><code>claude mcp add cove -- cove mcp</code></td></tr>
+<tr><td><b>Codex</b></td><td><code>codex mcp add cove -- cove mcp</code></td></tr>
+<tr><td><b>Gemini CLI</b></td><td><code>gemini mcp add cove cove mcp</code></td></tr>
+<tr><td><b>Cursor</b>, <b>Claude Desktop</b>, <b>Windsurf</b> and other <code>mcpServers</code> clients</td><td><code>{ "mcpServers": { "cove": { "command": "cove", "args": ["mcp"] } } }</code></td></tr>
+<tr><td><b>OpenCode</b></td><td><code>{ "mcp": { "cove": { "type": "local", "command": ["cove", "mcp"] } } }</code> in <code>opencode.json</code></td></tr>
+<tr><td><b><a href="https://github.com/deltalark/runo">Runo</a></b></td><td>Settings › Connections finds the Cove on your Mac by itself. <a href="#cove-and-runo">More below</a>.</td></tr>
+</table>
+
+**Agents on one machine, VMs on another.** `cove mcp` talks to whichever server the CLI does. Run `cove pair` on the server, then on the agent's machine:
+
+```sh
+cove login https://cove.example.com K7QF-2MXD     # the URL and the one-time code from cove pair
+claude mcp add cove -- cove mcp                    # now makes VMs on that server
+```
+
+Each login is a named key the server can revoke on its own with `cove keys rm`. Until Cove serves HTTPS itself (see the [roadmap](#roadmap)), reach a server through an SSH tunnel (`ssh -L 7457:127.0.0.1:7457 my-server`, then `http://127.0.0.1:7457`) or put an HTTPS reverse proxy in front of it before opening it up with `--listen`.
+
+**Or run the agent inside a VM.** For an agent you want fully boxed in, start a VM on your project with the folder shared, keys brokered and the network limited, then run the agent there:
+
+```sh
+cove up box --mount "$PWD:/work" --network allowlist --allow @agents --secret ANTHROPIC_API_KEY
+cove agents login claude                           # once per server; every VM gets the login
+cove shell box --cwd /work                         # then run claude, codex, gemini…
+```
 
 ## A quick tour
 
@@ -194,22 +248,13 @@ stateDiagram-v2
 
 ## Cove and Runo
 
-Cove is built to work hand in hand with [Runo](https://github.com/deltalark/runo), the native app for running coding agents side by side. In Runo, a Cove server is a **Connection**, and every session picks where it **Runs on**: your Mac, or any connection, moving between them between agent turns.
+Cove works on its own with any agent, and it is built hand in hand with [Runo](https://github.com/deltalark/runo), the native app for running coding agents side by side. In Runo, a Cove server is a **Connection**, and every session picks where it **Runs on**: your Mac, or any connection, moving between them between agent turns.
 
-**Set it up from Runo.** Settings › Connections finds the Cove on your Mac by itself, and installs it if it isn't there. For a server:
+**Set it up from Runo.** Settings › Connections finds the Cove on your Mac by itself, and installs it if it isn't there. For a server, install Cove there, run `cove pair`, and give Runo the server's URL and the one-time code. Runo gets a key of its own, which `cove keys rm` on the server revokes.
 
-1. Install Cove on the server with the Linux line above (Runo's Cove settings have it ready to copy).
-2. Run `cove pair` there. It prints a one-time code, good for 10 minutes.
-3. In Runo, add a Cove connection with the server's URL and that code, and press **Pair**. Runo gets a key of its own, which `cove keys rm` on the server revokes.
-
-The API is plain HTTP on `127.0.0.1:7457` by default, so reach a server through an SSH tunnel (`ssh -L 7457:127.0.0.1:7457 my-server`, then `http://127.0.0.1:7457`), or put an HTTPS reverse proxy in front of it before opening it up with `--listen`. Another computer's CLI connects the same way: `cove login <url> <code>`.
-
-**What a session gets:**
-
-- **On your Mac's Cove**, a VM of its own with the worktree shared in at the same path. The agent and terminals run in the VM; git, diffs and pull requests keep running on the Mac against the same files, so moving between the two is instant.
+- **On your Mac's Cove**, a session gets a VM of its own with the worktree shared in at the same path. The agent and terminals run in the VM; git, diffs and pull requests keep running on the Mac against the same files, so moving between the two is instant.
 - **On a remote Cove**, the VM keeps its own copy of the worktree, synced through git after every agent turn, uncommitted changes and the agent's conversation included. Close your laptop and the turn keeps running as a Cove named process; when Runo opens again it reattaches and brings the work back.
 - **When idle**, a session's VM pauses (or stops, if you prefer), and the next message wakes it.
-- **Agents use Cove too.** Through `cove mcp`, an agent can make scratch VMs of its own: to research without touching the worktree, run untrusted code with the network off, or hand a heavy build to a bigger machine.
 
 Runo checks `/v1/health` to see what a server supports, so an older Cove keeps working for what it can do.
 
@@ -429,10 +474,17 @@ flowchart LR
 - [x] Server settings, named keys and pairing codes; Runo Connections with turns that outlive your laptop
 - [x] Agent logins: sign in once per server, refreshed tokens kept in step across VMs
 
-**Next**
+**Next: easy for any agent, anywhere**
+
+- [ ] `cove connect <agent>`: add Cove to Claude Code, Codex, Gemini CLI, OpenCode or Cursor in one command
+- [ ] HTTPS out of the box: a self-signed certificate pinned through the pairing code, or a Let's Encrypt certificate for the server's IP with no domain needed
+- [ ] A remote MCP endpoint, so any MCP client connects with a URL and a key
+- [ ] `cove domain set`: your own domain, with HTTPS preview URLs that wake a paused VM on visit
+- [ ] `cove run <agent>`: an agent in a safe VM on the current folder, in one command
+
+**Later**
 
 - [ ] SSH from any terminal: a gateway with keys and paste-anywhere tokens
-- [ ] Public HTTPS ports on your own domain, with wake on visit
 - [ ] Secrets stored on the server and changeable on a running VM
 - [ ] A desktop agents can drive (computer use), with share links
 - [ ] A TypeScript SDK and a web dashboard
@@ -463,6 +515,11 @@ The end-to-end tests use the `host` backend, which runs the guest agent as a nor
 
 </details>
 
+## Contributing
+
+Issues and pull requests are welcome. New backends (Firecracker, libkrun, Apple's `container`) fit behind the backend layer in [`crates/core`](crates/core) without touching the rest. Run `cargo fmt --all`, `cargo clippy --workspace --all-targets` and `cargo test --workspace` before opening a pull request, as CI does.
+
 ## License
 
 [MIT](LICENSE)
+

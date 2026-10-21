@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="556" viewBox="0 0 960 556" role="img" aria-label="A terminal session: install Cove, add it to Claude Code, start a sandboxed VM with brokered secrets and an egress allowlist">
+<defs><linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#0F1629"/><stop offset="1" stop-color="#0A0F1E"/></linearGradient>
+<linearGradient id="edge" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#14B8A6" stop-opacity=".55"/><stop offset="1" stop-color="#2563EB" stop-opacity=".55"/></linearGradient></defs>
+<rect x="1" y="1" width="958" height="554" rx="14" fill="url(#bg)" stroke="url(#edge)" stroke-width="1.5"/>
+<path d="M1 44H959" stroke="#1E2843"/>
+<circle cx="26" cy="23" r="6" fill="#FF5F57"/><circle cx="46" cy="23" r="6" fill="#FEBC2E"/><circle cx="66" cy="23" r="6" fill="#28C840"/>
+<text x="480.0" y="28" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#6B7A99">anish@vps: ~</text>
+<g font-family="ui-monospace, SFMono-Regular, 'JetBrains Mono', Menlo, Consolas, monospace" font-size="14" xml:space="preserve">
+<text x="24" y="72" style="white-space:pre"><tspan fill="#2DD4BF">$ </tspan><tspan fill="#C9D1E3">curl -fsSL https://raw.githubusercontent.com/deltalark/cove/main/scripts/install.sh | sudo sh</tspan></text>
+<text x="24" y="96" style="white-space:pre"><tspan fill="#4ADE80">✓ </tspan><tspan fill="#C9D1E3">cove installed  </tspan><tspan fill="#6B7A99">backend: cloud-hypervisor (KVM) · systemd service running</tspan></text>
+<text x="24" y="144" style="white-space:pre"><tspan fill="#2DD4BF">$ </tspan><tspan fill="#C9D1E3">claude mcp add cove -- cove mcp</tspan><tspan fill="#6B7A99">            # or Codex, Gemini, Cursor, OpenCode, Runo</tspan></text>
+<text x="24" y="192" style="white-space:pre"><tspan fill="#2DD4BF">$ </tspan><tspan fill="#C9D1E3">cove up agent --mount ~/code/app:/work --network allowlist --allow @dev \</tspan></text>
+<text x="24" y="216" style="white-space:pre"><tspan fill="#C9D1E3">    --secret ANTHROPIC_API_KEY --secret GH_TOKEN</tspan></text>
+<text x="24" y="240" style="white-space:pre"><tspan fill="#6B7A99">NAME     STATE     IMAGE        CPU   MEMORY   DISK  NET</tspan></text>
+<text x="24" y="264" style="white-space:pre"><tspan fill="#C9D1E3">agent    </tspan><tspan fill="#4ADE80">running   </tspan><tspan fill="#C9D1E3">universal      2    4096M    20G  allowlist</tspan></text>
+<text x="24" y="312" style="white-space:pre"><tspan fill="#2DD4BF">$ </tspan><tspan fill="#C9D1E3">cove exec agent -- sh -c &#x27;echo $ANTHROPIC_API_KEY&#x27;</tspan></text>
+<text x="24" y="336" style="white-space:pre"><tspan fill="#FBBF24">sk-ant-api03-cove5f0c…</tspan><tspan fill="#6B7A99">            # a placeholder, not your key</tspan></text>
+<text x="24" y="384" style="white-space:pre"><tspan fill="#2DD4BF">$ </tspan><tspan fill="#C9D1E3">cove egress agent</tspan></text>
+<text x="24" y="408" style="white-space:pre"><tspan fill="#C9D1E3">api.anthropic.com      443  </tspan><tspan fill="#4ADE80">allowed, added ANTHROPIC_API_KEY</tspan></text>
+<text x="24" y="432" style="white-space:pre"><tspan fill="#C9D1E3">registry.npmjs.org     443  </tspan><tspan fill="#4ADE80">allowed</tspan></text>
+<text x="24" y="456" style="white-space:pre"><tspan fill="#C9D1E3">evil.example           443  </tspan><tspan fill="#F87171">BLOCKED: not on this VM&#x27;s allowlist</tspan></text>
+<text x="24" y="504" style="white-space:pre"><tspan fill="#2DD4BF">$ </tspan><tspan fill="#C9D1E3">cove pause agent</tspan><tspan fill="#6B7A99">                           # memory to disk; cove resume carries on</tspan></text>
+<rect x="40.8" y="514" width="8" height="16" fill="#2DD4BF" opacity=".85"/>
+<text x="24" y="528" fill="#2DD4BF" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14">$</text>
+</g></svg>
