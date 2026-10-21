@@ -1252,3 +1252,69 @@ fn names_from_urls_stay_inside_cove_folders() {
     }
     assert!(s.home.path().join("keep").is_dir());
 }
+
+#[test]
+fn https_pairing_pins_the_servers_certificate() {
+    let port = free_port();
+    let https = format!("127.0.0.1:{port}");
+    let s = start_server_with(&[("COVE_HTTPS", &https), ("COVE_PUBLIC_HOST", "127.0.0.1")]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::net::TcpStream::connect(&https).is_err() {
+        assert!(Instant::now() < deadline, "HTTPS listener did not start");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let v = s.json(&["pair"]);
+    let pair = v["pair"].as_str().unwrap().to_string();
+    let fp = v["fingerprint"].as_str().unwrap().to_string();
+    assert!(pair.starts_with(&format!("cove://127.0.0.1:{port}/")));
+    assert!(pair.ends_with(&format!("?fp={fp}")));
+
+    // Another computer: its own home, no COVE_URL.
+    let other = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        Command::new(bin())
+            .args(args)
+            .env("COVE_HOME", other.path())
+            .env_remove("COVE_URL")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+
+    // A wrong fingerprint is refused before the code is sent, so the code still works.
+    let code = v["code"].as_str().unwrap();
+    let url = format!("https://127.0.0.1:{port}");
+    let wrong = format!("sha256:{}", "0".repeat(64));
+    let out = run(&["login", &url, code, "--fingerprint", &wrong]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not the"));
+
+    let out = run(&["login", &pair]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let login: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(other.path().join("login.json")).unwrap()).unwrap();
+    assert_eq!(login["url"], url);
+    assert_eq!(login["fingerprint"], fp);
+
+    // Everything goes over the pinned HTTPS now: plain requests and the WebSocket stream.
+    let out = run(&["up", "tls1", "--backend", "host"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run(&["exec", "tls1", "--", "echo", "over-tls"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "over-tls");
+    let out = run(&["version"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("https"));
+    s.ok(&["rm", "tls1"]);
+}

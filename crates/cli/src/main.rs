@@ -41,6 +41,14 @@ enum Cmd {
     Serve {
         #[arg(long, default_value = DEFAULT_LISTEN)]
         listen: String,
+        /// Also serve HTTPS here for other computers, such as 0.0.0.0:7443, with a
+        /// certificate of the server's own that cove pair hands to clients to pin.
+        #[arg(long, env = "COVE_HTTPS", value_name = "ADDR")]
+        https: Option<String>,
+        /// The host name or address clients reach the HTTPS address at. Found by
+        /// itself when left out.
+        #[arg(long, env = "COVE_PUBLIC_HOST", requires = "https")]
+        public_host: Option<String>,
     },
     /// Check that this machine can run VMs.
     Doctor,
@@ -186,9 +194,14 @@ enum Cmd {
     },
     /// Connect this computer's CLI to a server with a code from `cove pair`.
     Login {
-        /// The server's URL, such as http://127.0.0.1:7457 through an SSH tunnel.
+        /// The cove:// line cove pair prints, or the server's URL, such as
+        /// http://127.0.0.1:7457 through an SSH tunnel.
         url: String,
-        code: String,
+        /// The pairing code, when the first argument is a URL.
+        code: Option<String>,
+        /// The SHA-256 fingerprint of the server's certificate, to pin it.
+        #[arg(long)]
+        fingerprint: Option<String>,
         /// What to call this computer's key on the server.
         #[arg(long)]
         name: Option<String>,
@@ -813,9 +826,17 @@ async fn run(cli: Cli) -> Result<i32> {
     let host = cli.host.clone();
     let client = || Client::from_env(host.clone());
     match cli.command {
-        Cmd::Serve { listen } => {
+        Cmd::Serve {
+            listen,
+            https,
+            public_host,
+        } => {
             let manager = Manager::new(Paths::from_env())?;
-            server::serve(manager, &listen).await?;
+            let https = https.map(|listen| server::HttpsOptions {
+                listen,
+                public_host,
+            });
+            server::serve(manager, &listen, https).await?;
         }
         Cmd::Doctor => return doctor(client().ok()).await,
         Cmd::Key => println!("{}", Paths::from_env().load_or_create_api_key()?),
@@ -1068,35 +1089,58 @@ async fn run(cli: Cli) -> Result<i32> {
                 .await?;
             show(json, &v, || {
                 let code = v["code"].as_str().unwrap_or("");
-                println!("Pairing code: {code}  (works once, for 10 minutes)");
-                println!();
-                println!("In Runo: add a Cove connection with this server's URL and the code.");
-                println!("From another computer: cove login <this server's URL> {code}");
-                println!("This server listens on {}.", client.url);
+                if let Some(pair) = v["pair"].as_str() {
+                    println!("Pair with:  {pair}");
+                    println!("Works once, for 10 minutes.");
+                    println!();
+                    println!("In Runo: add a Cove connection and paste that line.");
+                    println!("From another computer: cove login '{pair}'");
+                    if v["fingerprint"].is_string() {
+                        println!();
+                        println!(
+                            "The line carries this server's certificate fingerprint, so the other"
+                        );
+                        println!("side trusts exactly this server. If other computers reach it by another");
+                        println!("name or address, restart cove serve with --public-host.");
+                    }
+                } else {
+                    println!("Pairing code: {code}  (works once, for 10 minutes)");
+                    println!();
+                    println!("In Runo: add a Cove connection with this server's URL and the code.");
+                    println!("From another computer: cove login <this server's URL> {code}");
+                    println!("This server listens on {}.", client.url);
+                    println!(
+                        "Serve HTTPS for other computers with cove serve --https 0.0.0.0:7443."
+                    );
+                }
             });
         }
         Cmd::Login {
             url,
             code,
+            fingerprint,
             name,
             no_save,
         } => {
-            let url = client::server_url(Some(url));
+            let target = client::parse_pair_target(&url, code.as_deref(), fingerprint.as_deref())?;
+            let (url, code, fingerprint) = (target.url, target.code, target.fingerprint);
             let name = name.unwrap_or_else(|| {
                 format!(
                     "cli on {}",
                     hostname().unwrap_or_else(|| "a computer".into())
                 )
             });
-            let v = client::pair(&url, &code, &name).await?;
+            let v = client::pair(&url, &code, &name, fingerprint.as_deref()).await?;
             let key = v["key"].as_str().unwrap_or_default().to_string();
             if no_save {
-                let out =
-                    serde_json::json!({ "url": url, "name": v["name"], "id": v["id"], "key": key });
+                let out = serde_json::json!({
+                    "url": url, "name": v["name"], "id": v["id"], "key": key,
+                    "fingerprint": fingerprint,
+                });
                 show(json, &out, || println!("{key}"));
                 return Ok(0);
             }
-            client::save_login(&Paths::from_env(), &url, &key)?;
+            client::save_login(&Paths::from_env(), &url, &key, fingerprint.as_deref())?;
             let name = v["name"].as_str().unwrap_or("").to_string();
             show(
                 json,

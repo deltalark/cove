@@ -7,6 +7,7 @@ pub mod disk;
 pub mod egress;
 pub mod guest;
 pub mod gvisor;
+pub mod https;
 pub mod image;
 pub mod keys;
 pub mod logins;

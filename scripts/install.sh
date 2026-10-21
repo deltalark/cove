@@ -28,6 +28,8 @@ prefix="${COVE_PREFIX:-$HOME/.cove}"
 data="${COVE_HOME:-$HOME/.cove}"
 version=""
 listen="127.0.0.1:7457"
+https=""
+public_host=""
 service=1
 image=1
 from_source=0
@@ -47,6 +49,8 @@ Usage: install.sh [options]
   --prefix DIR        Install into DIR/bin (default: ~/.cove)
   --version TAG       Install this release, e.g. v0.2.0 (default: the latest)
   --listen ADDR       Address the server listens on (default: 127.0.0.1:7457)
+  --https ADDR        Also serve HTTPS for other computers here, e.g. 0.0.0.0:7443
+  --public-host NAME  The name or address other computers reach --https at
   --no-service        Don't start `cove serve` at login or boot
   --no-image          Don't pull the default image
   --no-link           Don't link cove into /opt/homebrew/bin or /usr/local/bin
@@ -78,6 +82,10 @@ while [ $# -gt 0 ]; do
     --version=*) version="${1#*=}"; shift ;;
     --listen) [ $# -ge 2 ] || die "--listen needs an address"; listen="$2"; shift 2 ;;
     --listen=*) listen="${1#*=}"; shift ;;
+    --https) [ $# -ge 2 ] || die "--https needs an address"; https="$2"; shift 2 ;;
+    --https=*) https="${1#*=}"; shift ;;
+    --public-host) [ $# -ge 2 ] || die "--public-host needs a name"; public_host="$2"; shift 2 ;;
+    --public-host=*) public_host="${1#*=}"; shift ;;
     --no-service) service=0; shift ;;
     --no-image) image=0; shift ;;
     --no-link) link=0; shift ;;
@@ -93,6 +101,24 @@ while [ $# -gt 0 ]; do
     *) usage >&2; die "unknown option $1" ;;
   esac
 done
+
+# The HTTPS listener, passed to the service as environment so nothing needs quoting.
+https_plist=""
+https_unit=""
+if [ -n "$https" ]; then
+  https_plist="
+    <key>COVE_HTTPS</key><string>$https</string>"
+  https_unit="
+Environment=COVE_HTTPS=$https"
+  if [ -n "$public_host" ]; then
+    https_plist="$https_plist
+    <key>COVE_PUBLIC_HOST</key><string>$public_host</string>"
+    https_unit="$https_unit
+Environment=COVE_PUBLIC_HOST=$public_host"
+  fi
+elif [ -n "$public_host" ]; then
+  die "--public-host goes with --https"
+fi
 
 case "$version" in
   "" | v*) ;;
@@ -501,7 +527,7 @@ if [ "$service" = 1 ] && [ "$backend_ready" = 1 ]; then
   </array>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>COVE_HOME</key><string>$data</string>
+    <key>COVE_HOME</key><string>$data</string>$https_plist
     <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
   <key>RunAtLoad</key><true/>
@@ -527,7 +553,7 @@ Wants=network-online.target
 
 [Service]
 ExecStart=$cove serve --listen $listen
-Environment=COVE_HOME=$data
+Environment=COVE_HOME=$data$https_unit
 Restart=on-failure
 # VMs are their own processes and keep running across server restarts.
 KillMode=process
@@ -591,10 +617,15 @@ if [ "$backend_ready" = 1 ]; then
   if [ "$os" = Darwin ]; then
     say "Runo finds this machine's Cove by itself."
   fi
-  say "To use it from Runo on another machine, run \`cove pair\` here and add a Cove"
-  say "connection in Runo with this server's URL and the code. The API is plain HTTP on"
-  say "$listen: reach it through an SSH tunnel (ssh -L 7457:127.0.0.1:7457 this-server)"
-  say "or put an HTTPS reverse proxy in front before opening it to the internet."
+  if [ -n "$https" ]; then
+    say "Other computers reach it over HTTPS on $https. Run \`cove pair\` here and paste the"
+    say "cove:// line it prints into Runo, or run \`cove login '<that line>'\` on the other computer."
+  else
+    say "To use it from Runo on another machine, run \`cove pair\` here and add a Cove"
+    say "connection in Runo with this server's URL and the code. The API is plain HTTP on"
+    say "$listen: reach it through an SSH tunnel (ssh -L 7457:127.0.0.1:7457 this-server),"
+    say "or run this script again with --https 0.0.0.0:7443 to serve HTTPS with a pinned certificate."
+  fi
 elif [ "$os" = Linux ] && [ ! -e /dev/kvm ]; then
   say "This machine has no /dev/kvm and no working gVisor, so it can't run Cove VMs."
   say "Run this script again as root and accept gVisor (or pass --gvisor), or pick a VPS"

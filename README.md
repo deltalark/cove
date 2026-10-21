@@ -167,57 +167,38 @@ The tools act on whichever server `cove` talks to: the one on this machine, or [
 
 For VMs that keep working while your laptop sleeps, and for Linux machines with more cores than your laptop.
 
-**1. On the server**, install Cove and make a one-time pairing code:
+**1. On the server**, install Cove with HTTPS on, and make a one-time pairing line:
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/deltalark/cove/main/scripts/install.sh | sudo sh
-cove pair                      # prints a code that works once, for 10 minutes
+```console
+$ curl -fsSL https://raw.githubusercontent.com/deltalark/cove/main/scripts/install.sh | sudo sh -s -- --https 0.0.0.0:7443
+$ cove pair
+Pair with:  cove://203.0.113.7:7443/4F7K-Q2XM?fp=sha256:9f2c41ab…
+Works once, for 10 minutes.
 ```
 
-**2. Reach it from your computer.** The API listens on `127.0.0.1:7457` on the server, so nothing is open to the internet until you choose to open it. Pick one:
+The server makes a certificate of its own, and the pairing line carries its fingerprint. The computer that pairs trusts exactly that certificate, the way SSH trusts a host key, so there's no domain to buy, no certificate authority and no warning to click through. If other computers reach the server by another name or address, add `--public-host`.
 
-<table>
-<tr>
-<th align="left" width="50%">An SSH tunnel: nothing to set up</th>
-<th align="left" width="50%">Your own domain, with HTTPS</th>
-</tr>
-<tr>
-<td valign="top">
+**2. Log in from your computer** with that line:
 
 ```sh
-ssh -fN -L 7457:127.0.0.1:7457 you@server
-```
-
-Then use `http://127.0.0.1:7457` as the server's URL. Keep the tunnel up with `autossh` or your SSH config.
-
-</td>
-<td valign="top">
-
-Point a DNS name at the server and let [Caddy](https://caddyserver.com) get the certificate:
-
-```caddy
-cove.example.com {
-    reverse_proxy 127.0.0.1:7457
-}
-```
-
-Then use `https://cove.example.com`. Nothing else to keep running on your side.
-
-</td>
-</tr>
-</table>
-
-**3. Log in from your computer**, with the URL and the code:
-
-```sh
-cove login https://cove.example.com 4F7K-Q2XM     # or http://127.0.0.1:7457 through the tunnel
-cove ls                                           # every cove command, and cove mcp, now uses that server
+cove login 'cove://203.0.113.7:7443/4F7K-Q2XM?fp=sha256:9f2c41ab…'
+cove ls                       # every cove command, and cove mcp, now uses that server
 ```
 
 Each computer gets an API key of its own, which `cove keys rm` on the server revokes. Ten wrong pairing codes in a row lock pairing for 10 minutes. Sign your agents in there once with [`cove agents login`](#agent-logins), and every VM on that server is signed in.
 
+<details>
+<summary><b>Rather not open a port?</b> An SSH tunnel, or your own domain behind a proxy</summary>
+
+Without `--https`, the API listens only on `127.0.0.1:7457` on the server, so nothing is open to the internet.
+
+- **An SSH tunnel:** `ssh -fN -L 7457:127.0.0.1:7457 you@server`, then `cove login http://127.0.0.1:7457 <code>`. Keep the tunnel up with `autossh` or your SSH config.
+- **Your own domain:** point a DNS name at the server and let [Caddy](https://caddyserver.com) get the certificate with `cove.example.com { reverse_proxy 127.0.0.1:7457 }`, then `cove login https://cove.example.com <code>`.
+
+</details>
+
 > [!TIP]
-> Coming next: `cove serve --domain` gets its own certificate without Caddy, and `cove connect you@server` does all three steps from your laptop in one command. See [the proposal](docs/easy-setup.md).
+> Coming next: Let's Encrypt certificates for your own domain or the server's bare IP address, so browsers and any MCP client trust it too, and `cove connect you@server` to do all of this from your laptop in one command. See [the proposal](docs/easy-setup.md).
 
 ## A quick tour
 
@@ -378,11 +359,11 @@ Runo checks `/v1/health` to see what a server supports, so an older Cove keeps w
 | `cove ports <name>` · `cove forward <name> <port>` | List ports and forward one |
 | `cove egress <name>` · `cove allow <name> [rules...]` | What a VM may reach and tried to; replace its allowlist |
 | `cove settings show` · `set K=V...` · `unset K...` | The server's defaults for new VMs |
-| `cove pair` · `cove login <url> <code>` · `cove logout` | Connect Runo or another computer with a one-time code |
+| `cove pair` · `cove login <cove://…>` or `<url> <code>` · `cove logout` | Connect Runo or another computer with a one-time code |
 | `cove keys ls` · `create <name>` · `rm <id>` | Named API keys, one per person or device |
 | `cove agents ls` · `login <agent> [--vm V]` · `logout <agent>` · `import <agent>` | Agent logins kept on the server for every VM |
 | `cove image ls` · `cove image pull <image> [--backend B]` | List and download base images |
-| `cove serve [--listen 127.0.0.1:7457]` · `cove doctor` · `cove key` | Run the server, check the host, print its key |
+| `cove serve [--listen 127.0.0.1:7457] [--https 0.0.0.0:7443]` · `cove doctor` · `cove key` | Run the server, check the host, print its key |
 | `cove mcp` · `cove mcp install [agent...]` · `uninstall` | The MCP server over stdio; add it to or remove it from agents' settings |
 | `cove version` | Versions, and the server's features |
 
@@ -431,7 +412,7 @@ Every request carries `Authorization: Bearer <key>`: the server's own key (`cove
 | `POST` · `GET` `DELETE` | `/v1/vms/{name}/snapshots` · `/v1/snapshots`, `/v1/snapshots/{name}` | Save a VM `{name, description}`; list and delete |
 | `GET` `PUT` | `/v1/settings` | Defaults for new VMs: `cpus, memory_mb, disk_gb, backend, network, allow, auto_pause_minutes, idle_stop_minutes, snapshot` |
 | `GET` `POST` · `DELETE` | `/v1/keys` · `/v1/keys/{id}` | POST `{name}` returns a new key once |
-| `POST` | `/v1/pair/codes` | A one-time code, good for 10 minutes |
+| `POST` | `/v1/pair/codes` | A one-time code, good for 10 minutes. With `--https`, also `url`, `fingerprint` and `pair`, the `cove://` line |
 | `GET` | `/v1/logins` | Each agent and whether it is signed in on this server (never the files) |
 | `PUT` · `DELETE` | `/v1/logins/{agent}` | PUT `{files: {path: base64}}` saves login files from elsewhere; DELETE signs the agent out here and in the VMs |
 | `POST` | `/v1/vms/{name}/logins/sync` | Sync that VM's logins now, as after signing in there |
@@ -508,11 +489,12 @@ flowchart LR
 - [x] Snapshots, `cove snapshot build` and a `universal` template
 - [x] Server settings, named keys and pairing codes; Runo Connections with turns that outlive your laptop
 - [x] Agent logins: sign in once per server, refreshed tokens kept in step across VMs
+- [x] HTTPS with a self-signed certificate pinned through the pairing line (`cove serve --https`)
 - [x] `cove mcp install`: add Cove to Claude Code, Codex, Gemini CLI, Qwen Code, OpenCode and Cursor in one command
 
 **Next**, with the plan for the first three in [docs/easy-setup.md](docs/easy-setup.md)
 
-- [ ] `cove serve --domain`: HTTPS on your own domain, certificate included
+- [ ] Let's Encrypt certificates for your own domain or the server's bare IP
 - [ ] `cove connect you@server`: install, pair and connect from your laptop in one command
 - [ ] SSH from any terminal: a gateway with keys and paste-anywhere tokens
 - [ ] Public HTTPS ports on your own domain, with wake on visit
