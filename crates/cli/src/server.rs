@@ -28,9 +28,15 @@ struct App {
 /// they should expect there.
 pub struct Public {
     pub url: String,
-    /// Set for a self-signed certificate, which clients pin; `None` for one a public
-    /// authority signed.
-    pub fingerprint: Option<String>,
+    pub certs: Arc<cove_core::acme::Certs>,
+}
+
+impl Public {
+    /// Set while the certificate is self-signed, which clients pin; `None` once a
+    /// public authority signed it.
+    pub fn fingerprint(&self) -> Option<String> {
+        self.certs.fingerprint()
+    }
 }
 
 pub struct ApiError(StatusCode, String);
@@ -468,9 +474,10 @@ async fn pair_code(
     let (code, expires_at) = app.pairing.lock().unwrap().issue(&name);
     let mut v = serde_json::json!({ "code": code, "expires_at": expires_at });
     if let Some(p) = &app.public {
+        let fp = p.fingerprint();
         v["url"] = p.url.clone().into();
-        v["fingerprint"] = p.fingerprint.clone().into();
-        v["pair"] = pair_string(&p.url, &code, p.fingerprint.as_deref()).into();
+        v["pair"] = pair_string(&p.url, &code, fp.as_deref()).into();
+        v["fingerprint"] = fp.into();
     }
     Json(v)
 }
@@ -786,6 +793,9 @@ async fn send_frame(tx: &mut (impl SinkExt<Message> + Unpin), frame: &Frame) -> 
 pub struct HttpsOptions {
     pub listen: String,
     pub public_host: Option<String>,
+    /// Get a certificate for this domain, or for the public IP with `ip`.
+    pub domain: Option<String>,
+    pub acme_email: Option<String>,
 }
 
 pub async fn serve(manager: Arc<Manager>, listen: &str, https: Option<HttpsOptions>) -> Result<()> {
@@ -798,24 +808,49 @@ pub async fn serve(manager: Arc<Manager>, listen: &str, https: Option<HttpsOptio
     if let Some(opts) = https {
         let tcp = tokio::net::TcpListener::bind(&opts.listen).await?;
         let bound = tcp.local_addr()?;
+        let ip_cert = opts.domain.as_deref() == Some("ip");
         let host = opts
             .public_host
             .clone()
+            .or_else(|| opts.domain.clone().filter(|_| !ip_cert))
             .unwrap_or_else(|| public_ip(bound.ip()).to_string());
-        let cert = cove_core::https::load_or_create_self_signed(
-            &manager.paths.root.join("tls"),
-            std::slice::from_ref(&host),
-        )?;
+        let tls_dir = manager.paths.root.join("tls");
+        let cert =
+            cove_core::https::load_or_create_self_signed(&tls_dir, std::slice::from_ref(&host))?;
+        let certs = cove_core::acme::Certs::new(&cert)?;
+        if let Some(domain) = &opts.domain {
+            let name = cove_core::acme::Name::parse(if ip_cert { &host } else { domain })?;
+            let directory = std::env::var("COVE_ACME_DIRECTORY")
+                .unwrap_or_else(|_| cove_core::acme::LETS_ENCRYPT.to_string());
+            if bound.port() != 443 && directory == cove_core::acme::LETS_ENCRYPT {
+                eprintln!(
+                    "warning: Let's Encrypt checks {name} on port 443, and HTTPS listens on \
+                     {bound}. Forward port 443 here, or listen on 0.0.0.0:443"
+                );
+            }
+            let acme = cove_core::acme::Acme {
+                name,
+                directory,
+                email: opts.acme_email.clone(),
+                root: std::env::var_os("COVE_ACME_ROOT").map(Into::into),
+                dir: tls_dir.join("acme"),
+            };
+            acme.load_saved(&certs);
+            tokio::spawn(acme.run(certs.clone(), |line| eprintln!("{line}")));
+        }
         let p = Public {
             url: https_url(&host, bound.port()),
-            fingerprint: Some(cert.fingerprint()),
+            certs: certs.clone(),
         };
         eprintln!(
-            "cove serving HTTPS on {bound}, for clients at {} (certificate {})",
+            "cove serving HTTPS on {bound}, for clients at {}{}",
             p.url,
-            p.fingerprint.as_deref().unwrap_or("")
+            match p.fingerprint() {
+                Some(fp) => format!(" (self-signed certificate {fp})"),
+                None => String::new(),
+            }
         );
-        tls = Some(TlsListener::spawn(tcp, cert.server_config()?));
+        tls = Some(TlsListener::spawn(tcp, certs.server_config()?));
         public = Some(Arc::new(p));
     }
     std::fs::write(
@@ -824,7 +859,7 @@ pub async fn serve(manager: Arc<Manager>, listen: &str, https: Option<HttpsOptio
             "url": url,
             "pid": std::process::id(),
             "https_url": public.as_ref().map(|p| p.url.clone()),
-            "fingerprint": public.as_ref().and_then(|p| p.fingerprint.clone()),
+            "fingerprint": public.as_ref().and_then(|p| p.fingerprint()),
         }))?,
     )?;
     eprintln!(

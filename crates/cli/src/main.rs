@@ -49,6 +49,18 @@ enum Cmd {
         /// itself when left out.
         #[arg(long, env = "COVE_PUBLIC_HOST", requires = "https")]
         public_host: Option<String>,
+        /// Get a Let's Encrypt certificate for this domain, or with `ip` for the
+        /// server's public IP address. Let's Encrypt checks it on port 443.
+        #[arg(
+            long,
+            env = "COVE_DOMAIN",
+            requires = "https",
+            value_name = "DOMAIN|ip"
+        )]
+        domain: Option<String>,
+        /// An email address Let's Encrypt can write to about the certificate.
+        #[arg(long, env = "COVE_ACME_EMAIL", requires = "domain")]
+        acme_email: Option<String>,
     },
     /// Check that this machine can run VMs.
     Doctor,
@@ -830,11 +842,15 @@ async fn run(cli: Cli) -> Result<i32> {
             listen,
             https,
             public_host,
+            domain,
+            acme_email,
         } => {
             let manager = Manager::new(Paths::from_env())?;
             let https = https.map(|listen| server::HttpsOptions {
                 listen,
                 public_host,
+                domain,
+                acme_email,
             });
             server::serve(manager, &listen, https).await?;
         }

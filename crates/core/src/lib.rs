@@ -1,6 +1,7 @@
 //! The VM side of cove: where things live on disk, images, disks, cloud-init
 //! seeds, backends that boot VMs, and the client that talks to the guest agent.
 
+pub mod acme;
 pub mod backend;
 pub mod chv;
 pub mod disk;

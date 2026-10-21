@@ -26,6 +26,19 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo build --workspace
+      - name: Fetch Pebble, Let's Encrypt's test server, for the ACME test
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p "$RUNNER_TEMP/pebble/certs/localhost"
+          curl -fsSL https://github.com/letsencrypt/pebble/releases/download/v2.8.0/pebble-linux-amd64.tar.gz \
+            | tar xz -C "$RUNNER_TEMP/pebble"
+          for f in localhost/cert.pem localhost/key.pem pebble.minica.pem; do
+            curl -fsSL -o "$RUNNER_TEMP/pebble/certs/$f" \
+              "https://raw.githubusercontent.com/letsencrypt/pebble/v2.8.0/test/certs/$f"
+          done
+          chmod +x "$RUNNER_TEMP/pebble/pebble-linux-amd64/linux/amd64/pebble"
+          echo "COVE_PEBBLE=$RUNNER_TEMP/pebble/pebble-linux-amd64/linux/amd64/pebble" >> "$GITHUB_ENV"
+          echo "COVE_PEBBLE_CERTS=$RUNNER_TEMP/pebble/certs" >> "$GITHUB_ENV"
       - run: cargo test --workspace
 
   guest:
