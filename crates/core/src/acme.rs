@@ -327,7 +327,12 @@ impl Acme {
             let creds: AccountCredentials = serde_json::from_str(&text)?;
             return Ok(builder()?.from_credentials(creds).await?);
         }
-        let contact = self.email.as_ref().map(|e| format!("mailto:{e}"));
+        let contact = self
+            .email
+            .as_deref()
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .map(|e| format!("mailto:{e}"));
         let contacts: Vec<&str> = contact.iter().map(|c| c.as_str()).collect();
         let (account, creds) = builder()?
             .create(
@@ -361,6 +366,8 @@ impl Acme {
 
         let key = KeyPair::generate()?;
         let mut params = CertificateParams::new(Vec::<String>::new())?;
+        // No subject: rcgen's default common name isn't a name Let's Encrypt will sign.
+        params.distinguished_name = rcgen::DistinguishedName::new();
         params.subject_alt_names = vec![self.name.san()?];
         let csr = params.serialize_request(&key)?;
         order.finalize_csr(csr.der()).await?;
