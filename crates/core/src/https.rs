@@ -115,14 +115,24 @@ pub fn load_or_create_self_signed(dir: &Path, names: &[String]) -> Result<Server
     })
 }
 
-/// A client config that accepts exactly the certificate with this fingerprint, and
-/// nothing else, whatever name or authority it shows.
+/// A client config that accepts the certificate with this fingerprint, or else one a
+/// public authority signed for the server's name. The second is for a server that has
+/// since got a Let's Encrypt certificate: it is as trustworthy as the pinned one, and
+/// paired clients carry on without pairing again.
 pub fn pinned_client_config(fingerprint: &str) -> Result<rustls::ClientConfig> {
     let want = normalize_fingerprint(fingerprint)?;
     let provider = provider();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let public = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        Arc::new(roots),
+        provider.clone(),
+    )
+    .build()?;
     let verifier = Arc::new(Pinned {
         want,
         provider: provider.clone(),
+        public,
     });
     let mut config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?
@@ -137,19 +147,25 @@ pub fn pinned_client_config(fingerprint: &str) -> Result<rustls::ClientConfig> {
 struct Pinned {
     want: String,
     provider: Arc<rustls::crypto::CryptoProvider>,
+    public: Arc<rustls::client::WebPkiServerVerifier>,
 }
 
 impl ServerCertVerifier for Pinned {
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp: &[u8],
-        _now: UnixTime,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp: &[u8],
+        now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
         let got = fingerprint(end_entity);
-        if got == self.want {
+        let public = || {
+            self.public
+                .verify_server_cert(end_entity, intermediates, server_name, ocsp, now)
+                .is_ok()
+        };
+        if got == self.want || public() {
             Ok(ServerCertVerified::assertion())
         } else {
             Err(rustls::Error::General(format!(

@@ -1318,3 +1318,83 @@ fn https_pairing_pins_the_servers_certificate() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("https"));
     s.ok(&["rm", "tls1"]);
 }
+
+/// Gets a real certificate from Pebble, Let's Encrypt's test server, for 127.0.0.1 the
+/// way `--domain ip` does on a VPS. Runs when `COVE_PEBBLE` points at a pebble binary
+/// and `COVE_PEBBLE_CERTS` at its `test/certs` folder (CI downloads both).
+#[test]
+fn acme_gets_an_ip_certificate_from_pebble() {
+    let (Ok(pebble), Ok(certs)) = (
+        std::env::var("COVE_PEBBLE"),
+        std::env::var("COVE_PEBBLE_CERTS"),
+    ) else {
+        eprintln!("skipped: set COVE_PEBBLE and COVE_PEBBLE_CERTS");
+        return;
+    };
+    let certs = PathBuf::from(certs);
+    let dir = tempfile::tempdir().unwrap();
+    let (acme_port, mgmt_port, https_port) = (free_port(), free_port(), free_port());
+    let config = serde_json::json!({ "pebble": {
+        "listenAddress": format!("127.0.0.1:{acme_port}"),
+        "managementListenAddress": format!("127.0.0.1:{mgmt_port}"),
+        "certificate": certs.join("localhost/cert.pem"),
+        "privateKey": certs.join("localhost/key.pem"),
+        "httpPort": free_port(),
+        "tlsPort": https_port,
+        "profiles": {
+            "default": { "description": "default", "validityPeriod": 7776000 },
+            "shortlived": { "description": "short", "validityPeriod": 518400 }
+        }
+    }});
+    let config_path = dir.path().join("pebble.json");
+    std::fs::write(&config_path, config.to_string()).unwrap();
+    struct Kill(Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _pebble = Kill(
+        Command::new(pebble)
+            .arg("-config")
+            .arg(&config_path)
+            .env("PEBBLE_VA_NOSLEEP", "1")
+            .env("PEBBLE_WFE_NONCEREJECT", "0")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::net::TcpStream::connect(("127.0.0.1", acme_port)).is_err() {
+        assert!(Instant::now() < deadline, "pebble did not start");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let https = format!("127.0.0.1:{https_port}");
+    let directory = format!("https://127.0.0.1:{acme_port}/dir");
+    let root = certs.join("pebble.minica.pem");
+    let s = start_server_with(&[
+        ("COVE_HTTPS", &https),
+        ("COVE_PUBLIC_HOST", "127.0.0.1"),
+        ("COVE_DOMAIN", "ip"),
+        ("COVE_ACME_DIRECTORY", &directory),
+        ("COVE_ACME_ROOT", root.to_str().unwrap()),
+    ]);
+    // Until the certificate arrives the line carries the self-signed fingerprint; after,
+    // it doesn't need one.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let v = s.json(&["pair"]);
+        if v["fingerprint"].is_null() {
+            assert_eq!(v["pair"].as_str().unwrap().split('?').count(), 1);
+            break;
+        }
+        assert!(Instant::now() < deadline, "no certificate from pebble");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let saved = s.home.path().join("tls/acme/127-0-0-1.pem");
+    let pem = std::fs::read_to_string(&saved).unwrap();
+    assert!(pem.contains("BEGIN CERTIFICATE"));
+}

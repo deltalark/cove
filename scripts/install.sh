@@ -30,6 +30,8 @@ version=""
 listen="127.0.0.1:7457"
 https=""
 public_host=""
+domain=""
+acme_email=""
 service=1
 image=1
 from_source=0
@@ -51,6 +53,9 @@ Usage: install.sh [options]
   --listen ADDR       Address the server listens on (default: 127.0.0.1:7457)
   --https ADDR        Also serve HTTPS for other computers here, e.g. 0.0.0.0:7443
   --public-host NAME  The name or address other computers reach --https at
+  --domain NAME|ip    Get a Let's Encrypt certificate for NAME, or for this server's
+                      public IP with "ip" (HTTPS on 0.0.0.0:443 unless --https says)
+  --acme-email EMAIL  An address Let's Encrypt can write to about the certificate
   --no-service        Don't start `cove serve` at login or boot
   --no-image          Don't pull the default image
   --no-link           Don't link cove into /opt/homebrew/bin or /usr/local/bin
@@ -86,6 +91,10 @@ while [ $# -gt 0 ]; do
     --https=*) https="${1#*=}"; shift ;;
     --public-host) [ $# -ge 2 ] || die "--public-host needs a name"; public_host="$2"; shift 2 ;;
     --public-host=*) public_host="${1#*=}"; shift ;;
+    --domain) [ $# -ge 2 ] || die "--domain needs a name, or ip"; domain="$2"; shift 2 ;;
+    --domain=*) domain="${1#*=}"; shift ;;
+    --acme-email) [ $# -ge 2 ] || die "--acme-email needs an address"; acme_email="$2"; shift 2 ;;
+    --acme-email=*) acme_email="${1#*=}"; shift ;;
     --no-service) service=0; shift ;;
     --no-image) image=0; shift ;;
     --no-link) link=0; shift ;;
@@ -105,6 +114,10 @@ done
 # The HTTPS listener, passed to the service as environment so nothing needs quoting.
 https_plist=""
 https_unit=""
+if [ -n "$domain" ] && [ -z "$https" ]; then
+  https="0.0.0.0:443"
+fi
+[ -z "$acme_email" ] || [ -n "$domain" ] || die "--acme-email goes with --domain"
 if [ -n "$https" ]; then
   https_plist="
     <key>COVE_HTTPS</key><string>$https</string>"
@@ -116,6 +129,13 @@ Environment=COVE_HTTPS=$https"
     https_unit="$https_unit
 Environment=COVE_PUBLIC_HOST=$public_host"
   fi
+  for pair in "COVE_DOMAIN=$domain" "COVE_ACME_EMAIL=$acme_email"; do
+    [ -n "${pair#*=}" ] || continue
+    https_plist="$https_plist
+    <key>${pair%%=*}</key><string>${pair#*=}</string>"
+    https_unit="$https_unit
+Environment=$pair"
+  done
 elif [ -n "$public_host" ]; then
   die "--public-host goes with --https"
 fi
@@ -617,7 +637,11 @@ if [ "$backend_ready" = 1 ]; then
   if [ "$os" = Darwin ]; then
     say "Runo finds this machine's Cove by itself."
   fi
-  if [ -n "$https" ]; then
+  if [ -n "$domain" ]; then
+    say "Other computers reach it over HTTPS on $https, with a Let's Encrypt certificate for"
+    say "${domain} once Let's Encrypt has checked it on port 443 (see $data/serve.log)."
+    say "Run \`cove pair\` here and paste the cove:// line it prints into Runo or \`cove login\`."
+  elif [ -n "$https" ]; then
     say "Other computers reach it over HTTPS on $https. Run \`cove pair\` here and paste the"
     say "cove:// line it prints into Runo, or run \`cove login '<that line>'\` on the other computer."
   else

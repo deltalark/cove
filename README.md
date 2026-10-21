@@ -178,6 +178,18 @@ Works once, for 10 minutes.
 
 The server makes a certificate of its own, and the pairing line carries its fingerprint. The computer that pairs trusts exactly that certificate, the way SSH trusts a host key, so there's no domain to buy, no certificate authority and no warning to click through. If other computers reach the server by another name or address, add `--public-host`.
 
+<details>
+<summary><b>Want a certificate browsers trust too?</b> Let's Encrypt, for your domain or just the server's IP</summary>
+
+```sh
+curl -fsSL …/install.sh | sudo sh -s -- --domain cove.example.com     # a DNS name pointing at the server
+curl -fsSL …/install.sh | sudo sh -s -- --domain ip                   # no domain: the server's public IP
+```
+
+Either one serves HTTPS on port 443 and gets a certificate from Let's Encrypt, which checks the name on that same port (TLS-ALPN-01), so nothing else needs to be open. With `ip`, it's one of Let's Encrypt's short-lived IP address certificates, about six days long. Cove renews any certificate halfway through its life, and keeps serving the one it has (the self-signed one at first) whenever it can't. Then any browser, script or MCP client can reach `https://cove.example.com` or `https://203.0.113.7` without pinning, and computers that paired while the certificate was self-signed carry on as they were. The same works without the installer: `cove serve --https 0.0.0.0:443 --domain ip`.
+
+</details>
+
 **2. Log in from your computer** with that line:
 
 ```sh
@@ -198,7 +210,7 @@ Without `--https`, the API listens only on `127.0.0.1:7457` on the server, so no
 </details>
 
 > [!TIP]
-> Coming next: Let's Encrypt certificates for your own domain or the server's bare IP address, so browsers and any MCP client trust it too, and `cove connect you@server` to do all of this from your laptop in one command. See [the proposal](docs/easy-setup.md).
+> Coming next: `cove connect you@server` to do all of this from your laptop in one command. See [the proposal](docs/easy-setup.md).
 
 ## A quick tour
 
@@ -363,7 +375,7 @@ Runo checks `/v1/health` to see what a server supports, so an older Cove keeps w
 | `cove keys ls` · `create <name>` · `rm <id>` | Named API keys, one per person or device |
 | `cove agents ls` · `login <agent> [--vm V]` · `logout <agent>` · `import <agent>` | Agent logins kept on the server for every VM |
 | `cove image ls` · `cove image pull <image> [--backend B]` | List and download base images |
-| `cove serve [--listen 127.0.0.1:7457] [--https 0.0.0.0:7443]` · `cove doctor` · `cove key` | Run the server, check the host, print its key |
+| `cove serve [--listen 127.0.0.1:7457] [--https 0.0.0.0:443 [--domain NAME\|ip]]` · `cove doctor` · `cove key` | Run the server, check the host, print its key |
 | `cove mcp` · `cove mcp install [agent...]` · `uninstall` | The MCP server over stdio; add it to or remove it from agents' settings |
 | `cove version` | Versions, and the server's features |
 
@@ -490,11 +502,11 @@ flowchart LR
 - [x] Server settings, named keys and pairing codes; Runo Connections with turns that outlive your laptop
 - [x] Agent logins: sign in once per server, refreshed tokens kept in step across VMs
 - [x] HTTPS with a self-signed certificate pinned through the pairing line (`cove serve --https`)
+- [x] Let's Encrypt certificates for your own domain or the server's bare IP (`--domain`)
 - [x] `cove mcp install`: add Cove to Claude Code, Codex, Gemini CLI, Qwen Code, OpenCode and Cursor in one command
 
 **Next**, with the plan for the first three in [docs/easy-setup.md](docs/easy-setup.md)
 
-- [ ] Let's Encrypt certificates for your own domain or the server's bare IP
 - [ ] `cove connect you@server`: install, pair and connect from your laptop in one command
 - [ ] SSH from any terminal: a gateway with keys and paste-anywhere tokens
 - [ ] Public HTTPS ports on your own domain, with wake on visit
